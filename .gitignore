@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Logs
+*.log
+run_log*.txt
+logic.log
+
+# Временные/отладочные скрипты
+patch_*.py
+fix_*.py
+check_*.py
+debug_*.py
+restore_*.py
+reinsert_*.py
+gen_*.py
+export_*.py
+run_*.py
+analyze_*.py
+clean_*.py
+print_*.py
+verify_*.py
+disable_*.py
+add_*.py
+
+# Данные (опционально - раскомментируй если не хочешь хранить)
+# data/
+
+# IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# Streamlit
+.streamlit/
+
+# Временные данные
+dashboard_data.csv
