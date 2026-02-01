@@ -65,7 +65,7 @@ MONTH_MAP = {
 MONTH_MAP_REV = {v: k for k, v in MONTH_MAP.items()}
 
 BUSINESS_RULES = {
-    'MIN_PLAN_THRESHOLD': 20000,
+    'MIN_PLAN_THRESHOLD': 0,  # Отключено по запросу
 }
 
 WEIGHT_2024 = 0.5
@@ -135,6 +135,26 @@ def load_limits_local():
         print(f"Error loading limits: {e}")
         return {}
 
+def load_growth_rates_local():
+    """Загружает годовые приросты для сопутствующих отделов. Возвращает dict с ключами-кортежами (Branch, Dept)."""
+    try:
+        filepath = os.path.join(DATA_DIR, 'growth_rates.json')
+        if not os.path.exists(filepath):
+            return {}
+        with open(filepath, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        growth = {}
+        for item in data:
+            branch = item.get('branch', '')
+            dept = item.get('dept', '')
+            rate = item.get('rate', 0)
+            if branch and dept:
+                growth[(branch, dept)] = rate
+        return growth
+    except Exception as e:
+        print(f"Error loading growth rates: {e}")
+        return {}
+
 # ============================================================================
 # ФУНКЦИИ РАСЧЁТА (ИЗ НОУТБУКА)
 # ============================================================================
@@ -194,14 +214,14 @@ RENOVATION_START_MONTH = 9
 INFLATION_CAP_PCT = 6
 
 # Минимальный порог плана (меньше - обнуляем)
-MIN_PLAN_THRESHOLD = 20000
+MIN_PLAN_THRESHOLD = 0  # Отключено по запросу
 
 # Шаг округления
 ROUNDING_STEP = 10000
 
 # Квартальная прогрессия роста для Дверей и Кухни
-QUARTER_PROGRESS_DOORS = {3: 0.15, 6: 0.30, 9: 0.60, 12: 1.00}
-QUARTER_PROGRESS_KITCHEN = {3: 0.15, 6: 0.30, 9: 0.60, 12: 1.00}
+QUARTER_PROGRESS_DOORS = {3: 0.20, 6: 0.40, 9: 0.60, 12: 1.00}
+QUARTER_PROGRESS_KITCHEN = {3: 0.20, 6: 0.40, 9: 0.60, 12: 1.00}
 
 
 def save_filters_local(filters_dict):
@@ -355,10 +375,12 @@ def apply_smooth_growth(df, dept_name, quarter_progress):
             if not month_mask.any():
                 continue
             idx = df.index[month_mask][0]
-            fact_2025 = df.loc[idx, 'Выручка_2025'] if 'Выручка_2025' in df.columns else 0
-            fact_2024 = df.loc[idx, 'Выручка_2024'] if 'Выручка_2024' in df.columns else 0
-            fact_2025 = fact_2025 if pd.notna(fact_2025) else 0
-            fact_2024 = fact_2024 if pd.notna(fact_2024) else 0
+            # Пытаемся взять данные из разных вариантов названия колонок
+            val_2025 = df.loc[idx, 'Выручка_2025'] if 'Выручка_2025' in df.columns else df.loc[idx, 'Rev_2025'] if 'Rev_2025' in df.columns else 0
+            val_2024 = df.loc[idx, 'Выручка_2024'] if 'Выручка_2024' in df.columns else df.loc[idx, 'Rev_2024'] if 'Rev_2024' in df.columns else 0
+            
+            fact_2025 = val_2025 if pd.notna(val_2025) else 0
+            fact_2024 = val_2024 if pd.notna(val_2024) else 0
             floor_val = max(fact_2024, fact_2025 * INFLATION)
             corr = df.loc[idx, 'Корр'] if pd.notna(df.loc[idx, 'Корр']) else None
             delta = df.loc[idx, 'Корр_Дельта'] if 'Корр_Дельта' in df.columns and pd.notna(df.loc[idx, 'Корр_Дельта']) else None
@@ -436,9 +458,10 @@ def apply_kitchen_smooth_growth(df):
 def apply_min_plan_network(df):
     """
     Применяет минимальный план для Мини/Микро/Интернет форматов.
-    План ≥ Выручка_2025 × 1.06
+    MIN_GROWTH = 1.0 означает: план не ниже факта (без принудительного роста).
+    Если прирост задан отдельно — он уже применён в calculate_plan.
     """
-    MIN_GROWTH = 1.06
+    MIN_GROWTH = 1.0  # FIX: Убрали принудительный рост 6%
     
     if 'Формат' not in df.columns:
         return df
@@ -645,6 +668,9 @@ def calculate_plan(df_sales, corrections=None, role_coefficients=None, limits=No
 
     # ========== ШАГ 2: Мастер-таблица ==========
     if df_rules is not None:
+        # Убираем дубликаты правил (один отдел - одно правило)
+        df_rules = df_rules.drop_duplicates(subset=['Филиал', 'Отдел'])
+        
         # Используем правила как основу
         df_master = df_rules.loc[df_rules.index.repeat(len(months))].reset_index(drop=True)
         df_master['Месяц'] = np.tile(months, len(df_rules))
@@ -710,20 +736,27 @@ def calculate_plan(df_sales, corrections=None, role_coefficients=None, limits=No
     df_s_2025['_norm_ratio'] = df_s_2025['_norm_ratio'].fillna(1.0)
     df_s_2025['Выручка_Norm'] = df_s_2025['Выручка'] * df_s_2025['_norm_ratio']
     
-    # Сетевая выручка по нормализованным данным
+    # Сетевая выручка по НОРМАЛИЗОВАННЫМ данным (сумма по всем филиалам отдела, с учётом нормализации провалов)
+    # Используем Выручка_Norm, чтобы исключить влияние ремонтов и провалов на профиль сезонности
     network_month = df_s_2025.groupby(['Отдел', 'Месяц'])['Выручка_Norm'].sum().reset_index()
     network_month.columns = ['Отдел', 'Месяц', 'Network_Month']
     
     network_year = df_s_2025.groupby('Отдел')['Выручка_Norm'].sum().reset_index()
     network_year.columns = ['Отдел', 'Network_Year']
     
-    # Сезонность = доля месяца в году
+    # Сезонность = доля месяца в году (по всем филиалам сети)
     seasonality = pd.merge(network_month, network_year, on='Отдел', how='left')
     seasonality['Seasonality_Share'] = np.where(
         seasonality['Network_Year'] > 0,
         seasonality['Network_Month'] / seasonality['Network_Year'],
         1.0 / 12
     )
+    
+    # Приведение типов перед merge
+    seasonality['Месяц'] = seasonality['Месяц'].astype(int)
+    df_master['Месяц'] = df_master['Месяц'].astype(int)
+    seasonality['Отдел'] = seasonality['Отдел'].astype(str).str.strip()
+    df_master['Отдел'] = df_master['Отдел'].astype(str).str.strip()
     
     df_master = pd.merge(df_master, seasonality[['Отдел', 'Месяц', 'Seasonality_Share', 'Network_Month']], 
                          on=['Отдел', 'Месяц'], how='left')
@@ -759,8 +792,9 @@ def calculate_plan(df_sales, corrections=None, role_coefficients=None, limits=No
             # "Структура только формата" — используем СЕТЕВУЮ выручку формата
             return row['Format_Network_Month'] if row['Format_Network_Month'] > 0 else 0.0
         elif row['_is_only_2025']:
-            # "Только 2025" — для Интернет используем сезонность
-            if fmt == 'Интернет':
+            # "Только 2025" — ЕДИНАЯ логика для сетевых форматов (Мини/Микро/Интернет):
+            # Годовая выручка × Сезонность сети
+            if fmt in ['Мини', 'Микро', 'Интернет', 'Интернет магазин']:
                 return rev_2025_year * row['Seasonality_Share'] if rev_2025_year > 0 else 0.0
             return rev_2025
         elif row['_is_2024_2025']:
@@ -775,7 +809,8 @@ def calculate_plan(df_sales, corrections=None, role_coefficients=None, limits=No
             return rev_2025_year * row['Seasonality_Share']
         else:
             # По умолчанию — как "Только 2025"
-            if fmt == 'Интернет':
+            # Для сетевых форматов — сезонность сети
+            if fmt in ['Мини', 'Микро', 'Интернет', 'Интернет магазин']:
                 return rev_2025_year * row['Seasonality_Share'] if rev_2025_year > 0 else 0.0
             return rev_2025
 
@@ -808,8 +843,23 @@ def calculate_plan(df_sales, corrections=None, role_coefficients=None, limits=No
         return pd.DataFrame()
     
     # Мержим целевые планы
+    # ПРИНУДИТЕЛЬНОЕ ПРИВЕДЕНИЕ ТИПОВ ДЛЯ МЕРЖА
+    df_master['Месяц'] = df_master['Месяц'].astype(int)
+    df_branch_plans['Месяц'] = df_branch_plans['Месяц'].astype(int)
+    df_master['Филиал'] = df_master['Филиал'].astype(str).str.strip()
+    df_branch_plans['Филиал'] = df_branch_plans['Филиал'].astype(str).str.strip()
+
     df_master = pd.merge(df_master, df_branch_plans[['Филиал', 'Месяц', 'План']], 
                          on=['Филиал', 'Месяц'], how='left')
+    
+    # ДИАГНОСТИКА
+    if df_master['План'].sum() == 0:
+        with st.expander("🔴 ОШИБКА: План = 0. Нажмите для диагностики", expanded=True):
+            st.error("Целевые планы филиалов не сопоставились с данными!")
+            st.write("Uniq Branches Master:", df_master['Филиал'].unique())
+            st.write("Uniq Branches Plans:", df_branch_plans['Филиал'].unique())
+            st.write("Sample Master Keys:", df_master[['Филиал', 'Месяц']].head())
+            st.write("Sample Plan Keys:", df_branch_plans[['Филиал', 'Месяц']].head())
 
 
     # ========== ШАГ 11: Инициализация колонок ==========
@@ -838,22 +888,171 @@ def calculate_plan(df_sales, corrections=None, role_coefficients=None, limits=No
             if delta_val is not None:
                 df_master.loc[idx, 'Корр_Дельта'] = delta_val
 
+    # ========== ПРЕДВАРИТЕЛЬНЫЙ РАСЧЁТ ДЛЯ СПЕЦ-ФОРМАТОВ (Идеальная Сезонность) ==========
+    # Для форматов: Мини, Микро, Интернет, Интернет магазин
+    # Логика: 
+    # - Для Сопутствующих отделов: План = Факт 2025 × (1 + Заданный Прирост%) × Сезонность
+    # - Для Стратегических: План = Прогноз × Глобальный Коэфф. роста
+    
+    # ВАЖНО: Добавляем колонку Роль в df_master для использования в Step 9 и Step 13
+    # Создаем dict {Отдел: Роль} для быстрого lookup
+    if df_roles is not None and not df_roles.empty:
+        role_map = df_roles.set_index('Отдел')['Роль'].to_dict()
+    else:
+        role_map = {}
+    
+    df_master['Роль'] = df_master['Отдел'].map(role_map).fillna('Стратегический')
+    
+    # ========== ШАГ 9: Расчёт для спец-форматов (Мини, Микро, Интернет) ==========
+    # Логика:
+    # 1. Сопутствующие: План = Факт_Год * Сезонность * (1 + Ручной_Прирост)
+    # 2. Стратегические: План = (Цель_Филиала - Сумма_Сопутствующих) * Доля_Внутри_Стратегических
+    #    Доля = (Факт_Год * Сезонность) / Сумма(Факт_Год * Сезонность) по стратегическим
+    
+    precalc_plans = {}
+    
+    # 1. Загружаем цели филиалов
+    if 'branch_plans' in st.session_state:
+        df_plans = st.session_state['branch_plans']
+    else:
+        df_plans = load_branch_plans()
+    
+    # Создаем маппинг целей: (Филиал, Месяц) -> План
+    target_map = df_plans.groupby(['Филиал', 'Месяц'])['План'].sum().to_dict()
+    
+    SPECIAL_FORMATS = ['Мини', 'Микро', 'Интернет', 'Интернет магазин']
+    
+    # 2. Фильтруем данные спец-форматов
+    special_mask = df_master['Формат'].isin(SPECIAL_FORMATS)
+    if special_mask.any():
+        growth_rates = load_growth_rates_local()
+        
+        # Получаем подмножество данных
+        df_spec = df_master[special_mask].copy()
+        
+        # Роль уже определена в df_master выше (через role_map)
+        
+        # --- РАСЧЁТ СОПУТСТВУЮЩИХ ---
+        # Функция получения прироста
+        def get_growth(row):
+            if row['Роль'] != 'Сопутствующий':
+                return 0
+            return growth_rates.get((row['Филиал'], row['Отдел']), 0) / 100.0
+
+        df_spec['Growth_Rate'] = df_spec.apply(get_growth, axis=1)
+        
+        # Предварительный расчёт "Теоретического плана" (база для распределения)
+        # Base = Факт_Год * Сезонность
+        df_spec['Base_Plan'] = df_spec['Rev_2025_Year'] * df_spec['Seasonality_Share']
+        
+        # План Сопутствующих (фиксированный)
+        df_spec['Calc_Plan'] = 0.0
+        acc_mask = df_spec['Роль'] == 'Сопутствующий'
+        df_spec.loc[acc_mask, 'Calc_Plan'] = df_spec.loc[acc_mask, 'Base_Plan'] * (1 + df_spec.loc[acc_mask, 'Growth_Rate'])
+        
+        # --- РАСЧЁТ СТРАТЕГИЧЕСКИХ (С остатка) ---
+        # Группируем по Филиал-Месяц
+        strat_mask = df_spec['Роль'] != 'Сопутствующий'
+        
+        # 1. Сумма планов сопутствующих по филиалу и месяцу
+        acc_sums = df_spec[acc_mask].groupby(['Филиал', 'Месяц'])['Calc_Plan'].sum().to_dict()
+        
+        # 2. Сумма базы стратегических (знаменатель для долей)
+        strat_base_sums = df_spec[strat_mask].groupby(['Филиал', 'Месяц'])['Base_Plan'].sum().to_dict()
+        
+        # 3. Распределяем остаток
+        def calc_strategic(row):
+            if row['Роль'] == 'Сопутствующий':
+                return row['Calc_Plan']
+            
+            branch, month = row['Филиал'], row['Месяц']
+            target = target_map.get((branch, month), 0)
+            
+            # Если таргета нет, фаллбэк на базу (как будто рост 0)
+            if target <= 0:
+                return row['Base_Plan']
+                
+            acc_sum = acc_sums.get((branch, month), 0)
+            residual = target - acc_sum
+            
+            # Если остаток отрицательный (сопутствующие съели всё), стратегическим 0 (или минимум?)
+            if residual < 0:
+                residual = 0
+            
+            strat_total = strat_base_sums.get((branch, month), 0)
+            
+            if strat_total > 0:
+                share = row['Base_Plan'] / strat_total
+                return residual * share
+            else:
+                return 0
+        
+        # Применяем расчёт
+        df_spec['Final_Plan'] = df_spec.apply(calc_strategic, axis=1)
+        
+        # Заносим в precalc_plans
+        for idx, row in df_spec.iterrows():
+            precalc_plans[(row['Филиал'], row['Отдел'], row['Месяц'])] = row['Final_Plan']
+
+    # DEBUG: Записываем precalc_plans в файл
+    with open('/tmp/precalc_debug.txt', 'w') as f:
+        f.write(f"Total precalc entries: {len(precalc_plans)}\n")
+        for key, val in precalc_plans.items():
+            if 'Владимир' in str(key[0]):
+                f.write(f"{key}: {val:,.0f}\n")
+
     # ========== ШАГ 12: Распределение плана по отделам ==========
+    
+    # Предрасчёт: максимальная месячная выручка за год для каждого (Филиал, Отдел)
+    # Используется для исключения в правиле +6%
+    max_rev_2025_by_branch_dept = {}
+    if 'Rev_2025' in df_master.columns:
+        for (branch, dept), grp in df_master.groupby(['Филиал', 'Отдел']):
+            max_val = grp['Rev_2025'].max()
+            if pd.notna(max_val):
+                max_rev_2025_by_branch_dept[(branch, dept)] = max_val
+    
+    # Загружаем прирост для спец-форматов (используется в fallback расчёте)
+    growth_rates_special = load_growth_rates_local()
+    
     results = []
     for (branch, month), group in df_master.groupby(['Филиал', 'Месяц']):
         target = group['План'].iloc[0]
         if pd.isna(target):
+            # Логируем пропущенные группы для диагностики
+            with open('/tmp/missing_targets.txt', 'a') as f:
+                f.write(f"Missing target: {branch}, Month {month}\n")
             results.append(group)
             continue
         target = int(round(target))
         
         g = group.copy()
         weights = g['Final_Weight'].copy()
-        fixed_mask = has_correction(g)
+        manual_fixed_mask = has_correction(g) # Только ручные
         no_plan_mask = g['_is_no_plan']
+        
+        # Определяем, кто является спец-форматом в этой группе
+        is_special = g['Формат'].isin(SPECIAL_FORMATS)
+        
+        # Логика для спец-форматов:
+        # 1. Сопутствующие -> ФИКСИРОВАННЫЕ (как ручные, берем из precalc)
+        # 2. Стратегические -> АКТИВНЫЕ (участвуют в балансировке под таргет)
+        roles = g['Роль'] if 'Роль' in g.columns else pd.Series('Стратегический', index=g.index)
+        is_spec_accomp = is_special & (roles == 'Сопутствующий') & ~no_plan_mask
+        is_spec_strat = is_special & (roles != 'Сопутствующий') & ~no_plan_mask
+        
+        # ВАЖНО: Веса для Стратегических НЕ переопределяем!
+        # Используем оригинальные Final_Weight (из Step 8), основанные на правилах/продажах.
+        # Это позволяет балансировке распределить МЕСЯЧНЫЙ таргет пропорционально,
+        # сохраняя сезонность таргета (а не сетевую сезонность).
+        # precalc используется только для Сопутствующих (fixed).
+
+        # Общая маска фиксации: Ручные ИЛИ (Спец-форматы И Сопутствующие)
+        # Стратегические спец-форматы теперь АКТИВНЫЕ!
+        fixed_mask = manual_fixed_mask | is_spec_accomp
         active_mask = ~fixed_mask & ~no_plan_mask
 
-        # Теоретический план
+        # Теоретический план (для всего, нужно для fallback)
         total_weight = weights.sum()
         if total_weight > 0:
             g['_theoretical'] = target * (weights / total_weight)
@@ -861,24 +1060,53 @@ def calculate_plan(df_sales, corrections=None, role_coefficients=None, limits=No
             g['_theoretical'] = 0
 
         # "Не считаем план" без корректировки = 0
-        no_plan_without_corr = no_plan_mask & ~fixed_mask
+        no_plan_without_corr = no_plan_mask & ~manual_fixed_mask
         g.loc[no_plan_without_corr, 'План_Расч'] = 0
 
-        # Фиксированные (с корректировками)
+        # Фиксированные (Ручные + Спец)
         if fixed_mask.any():
             for idx in g.index[fixed_mask]:
                 corr = g.loc[idx, 'Корр']
                 delta = g.loc[idx, 'Корр_Дельта']
-                base = g.loc[idx, '_theoretical']
+                
+                # Базовое значение:
+                # 1. Если это Спец-Формат -> берем Precalc (Идеальная сезонность)
+                # 2. Иначе -> берем Theoretical (Доля от месячного бюджета)
+                
+                # Ключ для Precalc
+                precalc_key = (g.loc[idx, 'Филиал'], g.loc[idx, 'Отдел'], g.loc[idx, 'Месяц'])
+                
+                if precalc_key in precalc_plans:
+                    base = precalc_plans[precalc_key]
+                    is_precalc = True
+                else:
+                    base = g.loc[idx, '_theoretical']
+                    is_precalc = False
 
+                # Применяем Ручные корректировки (Они имеют приоритет над base)
                 if pd.notna(corr):
-                    final = corr + (delta if pd.notna(delta) else 0)
+                    # Explicit 0 from user forces 0
+                    if corr == 0:
+                        final = 0
+                    else:
+                        # Add delta if exists
+                        final = corr + (delta if pd.notna(delta) else 0)
                 elif pd.notna(delta):
+                    # Delta only - add to base (Precalc or Theoretical)
                     final = base + delta
                 else:
+                    # No manual correction - use base
                     final = base
-
-                g.loc[idx, 'План_Расч'] = max(0, final)
+                
+                # Apply Rounding and Threshold rules (Standardized)
+                # Округляем до ближайших 10000 (по запросу пользователя)
+                final_rounded = round(final / ROUNDING_STEP) * ROUNDING_STEP
+                
+                # 3. Apply minimum threshold (если включен)
+                if final_rounded < MIN_PLAN_THRESHOLD:
+                    final_rounded = 0
+                
+                g.loc[idx, 'План_Расч'] = final_rounded
 
         # Остаток на активных
         actual_fixed = g.loc[fixed_mask, 'План_Расч'].sum() if fixed_mask.any() else 0
@@ -960,40 +1188,86 @@ def calculate_plan(df_sales, corrections=None, role_coefficients=None, limits=No
         g.loc[active_mask, 'План_Расч'] = (g.loc[active_mask, 'raw_plan'] / step).round(0).astype(int) * step
         
         # Считаем ошибку округления
-        current_total = g['План_Расч'].sum()
+        current_total = int(g['План_Расч'].sum())
         diff = target - current_total
+        
+        # Сколько ПОЛНЫХ шагов нужно добавить/убрать
         steps_needed = int(diff // step)
         
-        if steps_needed != 0:
-            # Считаем остатки
+        if steps_needed != 0 and active_mask.any():
+            # Считаем остатки (насколько мы "недодали" каждому отделу при округлении)
             g.loc[active_mask, 'diff_val'] = g.loc[active_mask, 'raw_plan'] - g.loc[active_mask, 'План_Расч']
+            
+            # Если нужно добавить (steps > 0): берем тех, у кого остаток наибольший (они "потеряли" при округлении)
+            # Если нужно убрать (steps < 0): берем тех, у кого остаток наименьший (они "получили" лишнее)
             ascending = (steps_needed < 0)
             sorted_indices = g[active_mask].sort_values('diff_val', ascending=ascending).index
+            
+            # Берем top N, где N = количество шагов
             indices_to_adjust = sorted_indices[:abs(steps_needed)]
             adjustment = step if steps_needed > 0 else -step
             g.loc[indices_to_adjust, 'План_Расч'] += adjustment
         
-        # Финальное распределение остатка пропорционально весам
-        current_total_after = g['План_Расч'].sum()
-        final_diff = target - current_total_after
-        if final_diff != 0:
-            # Распределяем остаток пропорционально весам активных отделов
-            distribute_mask = active_mask & (g['План_Расч'] > 0)
-            if distribute_mask.any():
-                w = weights.loc[distribute_mask]
-                w_sum = w.sum()
-                if w_sum > 0:
-                    # Распределяем пропорционально
-                    distribution = final_diff * (w / w_sum)
-                    g.loc[distribute_mask, 'План_Расч'] += distribution
-                    # Финальное округление до step
-                    g.loc[distribute_mask, 'План_Расч'] = (g.loc[distribute_mask, 'План_Расч'] / step).round(0).astype(int) * step
+        # Финальная проверка: после всех корректировок sum должен равняться target
+        final_total = int(g['План_Расч'].sum())
+        final_diff = target - final_total
+        
+        # Если остаток не равен 0 (из-за того что target не кратен step, или ошибки на границе),
+        # добавляем его к самому большому плану (чтобы минимизировать относительное искажение)
+        if final_diff != 0 and active_mask.any():
+            # Находим отдел с максимальным планом среди активных
+            active_plans = g.loc[active_mask, 'План_Расч']
+            if not active_plans.empty and active_plans.max() > 0:
+                max_idx = active_plans.idxmax()
+                g.loc[max_idx, 'План_Расч'] += final_diff
+        
+        # ========== ПРАВИЛО: Минимум +6% для спец-форматов ==========
+        # Для Мини, Микро, Интернет: План не может быть меньше Факт_2025 * 1.06
+        # ИСКЛЮЧЕНИЕ: если месяц был максимальным по продажам за год — правило не применяется
+        MIN_GROWTH_SPECIAL = 0.06  # +6%
+        if is_special.any():
+            for idx in g.index[is_special]:
+                rev_2025 = g.loc[idx, 'Rev_2025'] if 'Rev_2025' in g.columns else 0
+                dept = g.loc[idx, 'Отдел']
+                branch_name = g.loc[idx, 'Филиал']
+                
+                if pd.notna(rev_2025) and rev_2025 > 0:
+                    # Получаем максимум за год для этого (Филиал, Отдел)
+                    max_rev_year = max_rev_2025_by_branch_dept.get((branch_name, dept), 0)
                     
-                    # Если остался микроостаток — на максимальный
-                    micro_diff = target - g['План_Расч'].sum()
-                    if micro_diff != 0:
-                        max_idx = g.loc[distribute_mask, 'План_Расч'].idxmax()
-                        g.loc[max_idx, 'План_Расч'] += micro_diff
+                    # Проверяем: является ли этот месяц максимальным по продажам
+                    is_max_month = (rev_2025 >= max_rev_year * 0.999)  # 0.1% погрешность для float
+                    
+                    if is_max_month:
+                        # Для максимального месяца НЕ применяем +6%
+                        # НО если расчётный план = 0 (ошибка данных), пересчитываем
+                        if g.loc[idx, 'План_Расч'] <= 0:
+                            # Используем: Факт_Год × Сезонность × (1 + Прирост)
+                            rev_year = g.loc[idx, 'Rev_2025_Year'] if 'Rev_2025_Year' in g.columns else 0
+                            seas = g.loc[idx, 'Seasonality_Share'] if 'Seasonality_Share' in g.columns else 0
+                            
+                            # Если сезонность = 0 или NaN, используем равномерную (1/12)
+                            if pd.isna(seas) or seas <= 0:
+                                seas = 1.0 / 12
+                            
+                            # Прирост из настроек (загружен перед циклом)
+                            growth_key = (branch_name, dept)
+                            growth_rate = growth_rates_special.get(growth_key, 0) / 100.0
+                            
+                            # Расчёт
+                            if rev_year > 0:
+                                fallback_plan = rev_year * seas * (1 + growth_rate)
+                            else:
+                                fallback_plan = rev_2025  # Крайний fallback
+                            
+                            g.loc[idx, 'План_Расч'] = round(fallback_plan / step) * step
+                        continue
+                    
+                    min_plan = rev_2025 * (1 + MIN_GROWTH_SPECIAL)
+                    # Округляем минимум до step
+                    min_plan_rounded = round(min_plan / step) * step
+                    if g.loc[idx, 'План_Расч'] < min_plan_rounded:
+                        g.loc[idx, 'План_Расч'] = min_plan_rounded
         
         # Чистим временные колонки
         for col in ['_theoretical', 'raw_plan', 'diff_val']:
@@ -1014,7 +1288,7 @@ def calculate_plan(df_sales, corrections=None, role_coefficients=None, limits=No
     
     apply_doors_smooth_growth(result)
     apply_kitchen_smooth_growth(result)
-    result = apply_min_plan_network(result)
+    # result = apply_min_plan_network(result)  # Отключено по запросу — минимальный план не применяется
     
     # 4. Компрессор (перераспределение по ролям)
     if role_coefficients:
@@ -1028,6 +1302,11 @@ def calculate_plan(df_sales, corrections=None, role_coefficients=None, limits=No
     
     for (branch, month), group in result.groupby(['Филиал', 'Месяц']):
         idx = group.index
+        
+        # Для спец-форматов НЕ делаем балансировку — их план уже рассчитан по сезонности
+        branch_format = result.loc[idx, 'Формат'].iloc[0] if 'Формат' in result.columns else None
+        if branch_format in SPECIAL_FORMATS:
+            continue
         
         target = result.loc[idx, 'План'].iloc[0]
         if pd.isna(target):
@@ -1142,25 +1421,79 @@ def calculate_plan(df_sales, corrections=None, role_coefficients=None, limits=No
              dist_weights = (weights / w_sum) if w_sum > 0 else pd.Series(1, index=all_active)
              result.loc[all_active, 'План_Расч'] += remaining_diff * dist_weights
 
-        # Округление (Largest Remainder Method)
-        # Применяем ко всем активным, так как после итераций у нас могут быть дроби
-        current_vals = result.loc[active_idx, 'План_Расч']
-        rounded_vals = current_vals.round(0).astype(int)
-        result.loc[active_idx, 'План_Расч'] = rounded_vals
+        # Округление до ROUNDING_STEP (только для НЕ спец-форматов!)
+        # Спец-форматы должны сохранить точную сезонность
+        is_special = result.loc[active_idx, 'Формат'].isin(SPECIAL_FORMATS) if 'Формат' in result.columns else pd.Series(False, index=active_idx)
+        non_special_idx = active_idx[~is_special]
         
-        # Остаток от округления - на макс вес (среди незафиксированных лимитом, если возможно, или просто макс вес)
-        # Упрощаем: кидаем на макс вес из всех активных
-        new_diff = target - result.loc[idx, 'План_Расч'].sum()
-        if new_diff != 0:
-            candidates_w = result.loc[active_idx, 'Final_Weight']
-            if candidates_w.sum() == 0:
-                 candidates_w = result.loc[active_idx, 'План_Расч']
+        if len(non_special_idx) > 0:
+            # 1. Округляем до ближайших 10000 (только обычные форматы)
+            current_vals = result.loc[non_special_idx, 'План_Расч']
+            rounded_vals = (current_vals / ROUNDING_STEP).round(0) * ROUNDING_STEP
             
-            max_w_idx = candidates_w.idxmax()
-            result.loc[max_w_idx, 'План_Расч'] += new_diff
+            # 2. Обнуляем те, что меньше порога
+            rounded_vals = np.where(rounded_vals < MIN_PLAN_THRESHOLD, 0, rounded_vals)
+            result.loc[non_special_idx, 'План_Расч'] = rounded_vals
+        
+        # 3. Балансируем разницу (остаток должен быть кратен шагу, так как target тоже кратен или округляем и его)
+        # target уже округлен до целого, но не обязательно до 10к.
+        # В оригинале target - это план филиала, он обычно круглый, но проверим.
+        
+        current_sum = result.loc[idx, 'План_Расч'].sum()
+        new_diff = target - current_sum
+        
+        # Разницу тоже нужно привести к шагу, чтобы не ломать кратность
+        # Если target не кратен 10к, то мы не сможем сделать сумму кратной.
+        # Но будем считать, что нам важно, чтобы слагаемые были кратны.
+        # Остаток просто кидаем на макс вес.
+        
+        if new_diff != 0:
+            # Округляем разницу до шага (чтобы сохранить кратность планов)
+            # Внимание: тогда сумма может не сойтись с target, если target не кратен 10к.
+            # Но требование "все планы кратны 10к" приоритетнее точного соответствия некруглому target.
+            
+            diff_rounded = round(new_diff / ROUNDING_STEP) * ROUNDING_STEP
+            
+            if diff_rounded != 0:
+                candidates_w = result.loc[active_idx, 'Final_Weight']
+                if candidates_w.sum() == 0:
+                     candidates_w = result.loc[active_idx, 'План_Расч']
+                
+                # Если все активные обнулились из-за порога, ищем кого вернуть к жизни
+                if candidates_w.sum() == 0 and len(active_idx) > 0:
+                    max_w_idx = active_idx[0] # Просто первый попавшийся
+                elif len(active_idx) > 0:
+                    max_w_idx = candidates_w.idxmax()
+                else:
+                    max_w_idx = None
+
+                if max_w_idx:
+                    # Проверяем, не станет ли он < порога (если был 0, а мы вычитаем - нельзя)
+                    # Если добавляем положительное - ок.
+                    # Если вычитаем - надо следить.
+                    
+                    val = result.loc[max_w_idx, 'План_Расч'] + diff_rounded
+                    if val >= MIN_PLAN_THRESHOLD or val == 0: 
+                         result.loc[max_w_idx, 'План_Расч'] = val
+                    elif val > 0: # val < 30000 -> 30000
+                         # Если не лезет в минимум, то либо 30000 либо 0
+                         # Лучше поставим минимум, если разница позволяет
+                         result.loc[max_w_idx, 'План_Расч'] = MIN_PLAN_THRESHOLD
 
     # ========== ШАГ 14: Финализация ==========
     result['План_Скорр'] = result['План_Расч'].copy()
+
+    # DEBUG: Проверяем финальные значения
+    debug_df = result[(result['Филиал'] == 'Владимир Лента') & (result['Отдел'] == '1А. Сантехника инженерная')]
+    with open('/tmp/final_debug.txt', 'w') as f:
+        f.write("=== ФИНАЛЬНЫЕ ЗНАЧЕНИЯ 1А ===\n")
+        for _, row in debug_df.sort_values('Месяц').iterrows():
+            m = row['Месяц']
+            plan = row['План_Скорр']
+            seas = row['Seasonality_Share']
+            f.write(f"Месяц {m}: План={plan:,.0f}, Seas_Сеть={seas:.4f} ({seas*100:.2f}%)\n")
+        f.write(f"\nСумма плана: {debug_df['План_Скорр'].sum():,.0f}\n")
+        f.write(f"Сумма сезонности: {debug_df['Seasonality_Share'].sum():.6f}\n")
 
     # ========== ШАГ 14: Расчёт дополнительных колонок ==========
     
@@ -1199,6 +1532,82 @@ def calculate_plan(df_sales, corrections=None, role_coefficients=None, limits=No
                     '_base', '_total_base', 'Network_Month', 'Format_Network_Month']
     result = result.drop(columns=[c for c in cols_to_drop if c in result.columns], errors='ignore')
 
+    # ========== ШАГ 15: Площади и Отдача ==========
+    
+    # Загружаем площади
+    try:
+        df_area_full = load_areas()
+    except:
+        df_area_full = None
+    
+    if df_area_full is not None and not df_area_full.empty:
+        # Площадь 2025
+        area_2025 = df_area_full[df_area_full['Год'] == 2025][['Филиал', 'Отдел', 'Месяц', 'Площадь']]
+        area_2025.columns = ['Филиал', 'Отдел', 'Месяц', 'Площадь_2025']
+        
+        # Площадь 2026 (пока берем как 2025, если нет данных, или если есть - используем 2026)
+        # Если в ref файле есть 2026, используем его
+        area_2026 = df_area_full[df_area_full['Год'] == 2026][['Филиал', 'Отдел', 'Месяц', 'Площадь']]
+        if area_2026.empty:
+             area_2026 = area_2025.copy()
+             area_2026.columns = ['Филиал', 'Отдел', 'Месяц', 'Площадь_2026']
+        else:
+             area_2026.columns = ['Филиал', 'Отдел', 'Месяц', 'Площадь_2026']
+
+        result = pd.merge(result, area_2025, on=['Филиал', 'Отдел', 'Месяц'], how='left')
+        result = pd.merge(result, area_2026, on=['Филиал', 'Отдел', 'Месяц'], how='left')
+        
+    else:
+        result['Площадь_2025'] = 0
+        result['Площадь_2026'] = 0
+
+    result['Площадь_2025'] = result['Площадь_2025'].fillna(0)
+    result['Площадь_2026'] = result['Площадь_2026'].fillna(0)
+    
+    # Delta Area
+    result['Δ_Площадь_%'] = np.where(
+        result['Площадь_2025'] > 0,
+        ((result['Площадь_2026'] - result['Площадь_2025']) / result['Площадь_2025']) * 100,
+        0
+    )
+
+    # Отдача (Выручка / Площадь)
+    # Отдача 2025
+    result['Отдача_2025'] = np.where(
+        result['Площадь_2025'] > 0,
+        result['Rev_2025'] / result['Площадь_2025'],
+        0
+    )
+    result['Отдача_2025'] = result['Отдача_2025'].round(0).astype(int)
+
+    # Отдача План (2026)
+    result['Отдача_План'] = np.where(
+        result['Площадь_2026'] > 0,
+        result['План_Скорр'] / result['Площадь_2026'],
+        0
+    )
+    result['Отдача_План'] = result['Отдача_План'].round(0).astype(int)
+
+    # Delta Efficiency
+    result['Δ_Отдача_%'] = np.where(
+        result['Отдача_2025'] > 0,
+        ((result['Отдача_План'] - result['Отдача_2025']) / result['Отдача_2025']) * 100,
+        0
+    )
+
+    # Restore/Enable requested columns
+    # _План_Расч_Исх (Original/Base)
+    if '_theoretical' in result.columns:
+        result['_План_Расч_Исх'] = result['_theoretical'].fillna(0)
+    elif 'Рекоменд' in result.columns:
+        result['_План_Расч_Исх'] = result['Рекоменд']
+    else:
+        result['_План_Расч_Исх'] = result['План_Расч']
+
+    # Авто_Корр
+    if 'Авто_Корр' not in result.columns:
+        result['Авто_Корр'] = 0 
+        
     return result
 
 
@@ -1382,6 +1791,9 @@ def load_areas():
         
         # Фильтрация: только 2024+
         df_merged = df_merged[df_merged['Год'] >= 2024]
+        
+        # Возвращаем числовой месяц!
+        df_merged = df_merged.drop(columns=['Месяц']).rename(columns={'Month_Num': 'Месяц'})
         
         return df_merged[['Филиал', 'Отдел', 'Месяц', 'Год', 'Площадь']]
         
@@ -1734,13 +2146,27 @@ if 'data_loaded' not in st.session_state:
         st.session_state['data_loaded'] = True
         st.session_state['load_time'] = pd.Timestamp.now().strftime('%H:%M:%S')
 
-# Сайдбар - Кнопка обновления вверху
-if st.sidebar.button("🔄 Обновить", type="primary"):
-    for key in ['data_loaded', 'raw_sales', 'rules', 'roles', 'branch_plans', 'areas']:
-        if key in st.session_state:
+# Сайдбар - Кнопки управления
+col_refresh, col_restart = st.sidebar.columns(2)
+
+with col_refresh:
+    if st.button("🔄 Обновить", type="primary", use_container_width=True):
+        for key in ['data_loaded', 'raw_sales', 'rules', 'roles', 'branch_plans', 'areas']:
+            if key in st.session_state:
+                del st.session_state[key]
+        st.cache_data.clear()
+        st.rerun()
+
+with col_restart:
+    if st.button("🔧 Перезапуск", type="secondary", use_container_width=True, help="Полный сброс: очищает ВСЕ кэши и перезагружает код"):
+        # Полная очистка всех кэшей
+        st.cache_data.clear()
+        st.cache_resource.clear()
+        # Очистка session state полностью
+        for key in list(st.session_state.keys()):
             del st.session_state[key]
-    st.cache_data.clear()
-    st.rerun()
+        # Перезапуск
+        st.rerun()
 
 # Редактор лимитов перенесен в основную часть страницы (под графики)
 pass
@@ -1835,26 +2261,75 @@ sel_depts = st.sidebar.multiselect("Отдел", all_depts, default=default_dept
 sel_months = st.sidebar.multiselect("Месяц", all_months, default=default_months, format_func=lambda x: MONTH_MAP_REV[x], placeholder="Все месяцы")
 
 # Кнопка сохранения фильтров
-if st.sidebar.button("💾 Сохранить фильтры"):
-    filters_to_save = {
-        'branches': sel_branches,
-        'depts': sel_depts,
-        'months': sel_months
-    }
-    if save_filters_local(filters_to_save):
-        st.sidebar.success("Фильтры сохранены!")
+
 
 st.sidebar.divider()
 
 
 # Выбор колонок для таблицы
+# Выбор колонок для таблицы
+# Выбор колонок для таблицы
 st.sidebar.header("📋 Колонки таблицы")
-all_columns = ['Филиал', 'Отдел', 'Мес', 'Роль', 'Корр±', 'Корр', 'Рекоменд', 'План 2026', 
-               'Выр.2025', 'Выр.2024', 'Выр.25(Н)', 'Δ%_25', 'Δ%_24', 
-               'Сез.Факт', 'Сез.План', 'Вес', 'Цель', 'Расчёт', 'Правило']
-default_columns = ['Филиал', 'Отдел', 'Мес', 'Роль', 'Корр±', 'Корр', 'Рекоменд', 'План 2026', 
-                   'Выр.2025', 'Выр.2024', 'Δ%_25', 'Δ%_24', 'Сез.Факт', 'Сез.План']
-sel_columns = st.sidebar.multiselect("Показать колонки", all_columns, default=default_columns)
+# Выбор колонок для таблицы
+st.sidebar.header("📋 Колонки таблицы")
+
+# Обязательные колонки (всегда видны, порядок фиксирован в начале)
+MANDATORY_COLS = ['Филиал', 'Отдел', 'Мес', 'Корр', 'Корр±', 'План_Скорр', 'Выручка_2025']
+
+# Полный список всех возможных
+all_columns_full = ['Филиал', 'Отдел', 'Мес', 'Роль', 'Формат', 'Правило', 
+               'Корр', 'Корр±', 'Авто_Корр',
+               'План_Скорр', 'План_Расч', 'План', '_План_Расч_Исх', 'Рекоменд',
+               'Выручка_2025', 'Выручка_2024', 'Выручка_2025_Норм',
+               'Прирост_%', 'Прирост_24_26_%',
+               'Сезонность_Факт', 'Сезонность_План',
+               'Площадь_2025', 'Площадь_2026', 'Δ_Площадь_%',
+               'Отдача_План', 'Отдача_2025', 'Δ_Отдача_%',
+               'Final_Weight', 'is_network_format', 'Месяц']
+
+# Опциональные (те что можно скрывать) = Все минус Обязательные
+optional_columns = [c for c in all_columns_full if c not in MANDATORY_COLS]
+
+# Настройки по умолчанию для опциональных (убрали 'План' чтобы не путать с План_Скорр)
+default_optional_init = ['Выручка_2024', 'Прирост_%', 'Прирост_24_26_%', 
+                         'Площадь_2025', 'Площадь_2026', 'Отдача_План', 'Отдача_2025']
+
+# Пытаемся взять из сохранений
+# Сначала пробуем новый ключ 'optional_columns', потом старый 'columns'
+saved_optional_cols = saved_filters.get('optional_columns', [])
+if not saved_optional_cols:
+    # Fallback: старый формат - берём из 'columns' только опциональные
+    saved_all_cols = saved_filters.get('columns', [])
+    saved_optional_cols = [c for c in saved_all_cols if c in optional_columns]
+
+if saved_optional_cols:
+    # Фильтруем только валидные опциональные колонки
+    default_optional = [c for c in saved_optional_cols if c in optional_columns]
+else:
+    default_optional = default_optional_init
+
+st.sidebar.caption("🔒 Основные колонки (Филиал, Отдел, Мес, Корр..., Выручка, План) закреплены.")
+sel_optional = st.sidebar.multiselect("Дополнительные колонки", optional_columns, default=default_optional)
+
+# Итоговый список колонок для отображения: Обязательные + Выбранные опциональные
+# Сохраняем порядок: Сначала обязательные (в определенном порядке?), или перемешиваем?
+# Лучше держать Обязательные в начале, или хотя бы Филиал/Отдел/Мес
+# Давайте соберем в порядке appearance в all_columns_full для консистентности
+sel_columns = [c for c in all_columns_full if c in MANDATORY_COLS or c in sel_optional]
+
+
+
+# Обновляем кнопку сохранения, чтобы сохранять и колонки
+if st.sidebar.button("💾 Сохранить настройки"):
+    # Сохраняем только опциональные колонки (не обязательные)
+    filters_to_save = {
+        'branches': sel_branches,
+        'depts': sel_depts,
+        'months': sel_months,
+        'optional_columns': sel_optional  # <- Сохраняем только опциональные
+    }
+    if save_filters_local(filters_to_save):
+        st.sidebar.success("Настройки (фильтры и столбцы) сохранены!")
 
 
 
@@ -1872,6 +2347,8 @@ if sel_depts:
 if sel_months:
     df = df[df['Месяц'].isin(sel_months)]
 
+if sel_months:
+    df = df[df['Месяц'].isin(sel_months)]
 
 
 # Убираем отступы вверху страницы
@@ -1960,7 +2437,7 @@ if convergence_details:
 
 # === 4 ГРАФИКА В ОДИН РЯД ===
 # Пропорции: Динамика(1), Отделы(1.5), Филиалы(1.5), Сезонность(1)
-col1, col2, col3, col4 = st.columns([1, 1.5, 1.5, 1])
+col1, col2, col3, col4 = st.columns([1, 1, 1, 1])
 
 
 # 1. График динамики
@@ -1970,13 +2447,17 @@ with col1:
     aggregated_sum = df['План_Скорр'].sum()
     # st.info(f"Сумма плана (фильтр): {aggregated_sum:,.0f} | Строк: {len(df)}")
     all_months_df = pd.DataFrame({'Месяц': range(1, 13)})
-    m_agg = df.groupby('Месяц').agg({
+    agg_dict = {
         'План_Скорр': 'sum',
         'План_Расч': 'sum',
         'Корр_Дельта': 'sum',
         'Rev_2025': 'sum',
         'Rev_2024': 'sum'
-    }).reset_index()
+    }
+    # Добавляем сезонность если есть (для одного отдела это одинаковое значение)
+    if 'Seasonality_Share' in df.columns:
+        agg_dict['Seasonality_Share'] = 'first'
+    m_agg = df.groupby('Месяц').agg(agg_dict).reset_index()
     m_full = pd.merge(all_months_df, m_agg, on='Месяц', how='left').fillna(0)
     m_full['M'] = m_full['Месяц'].map(MONTH_MAP_REV)
     
@@ -2349,7 +2830,43 @@ with col4:
     m_full['Сез_24'] = m_full['Rev_2024'] / total_24 * 100 if total_24 > 0 else 0
     m_full['Δ_Сез'] = m_full['Сез_План'] - m_full['Сез_25']  # В процентных пунктах
     
+    # --- ЭТАЛОННАЯ СЕЗОННОСТЬ СЕТИ (правильный расчёт) ---
+    # --- ЭТАЛОННАЯ СЕЗОННОСТЬ СЕТИ (правильный расчёт) ---
+    
+    # DEBUG: Проверка наличия колонок (скрыто в экспандер)
+    # with st.expander("DEBUG: Columns"):
+    #     st.write(df.columns.tolist())
+    
+    # 1. Основной метод: через Network_Month (сумма продаж сети)
+    if 'Network_Month' in df.columns:
+        unique_net = df.drop_duplicates(subset=['Отдел', 'Месяц'])
+        net_agg = unique_net.groupby('Месяц')['Network_Month'].sum().reset_index()
+        net_total = net_agg['Network_Month'].sum()
+        
+        net_agg['Сез_Сеть'] = np.where(net_total > 0, (net_agg['Network_Month'] / net_total) * 100, 0)
+        
+        # Обновляем m_full
+        m_full = pd.merge(m_full, net_agg[['Месяц', 'Сез_Сеть']], on='Месяц', how='left').fillna(0)
+        
+    elif 'Seasonality_Share' in df.columns:
+        # Fallback 1: через Seasonality_Share (корректно для одного отдела)
+        # Берем среднее по месяцу (так как для одного отдела значения одинаковые)
+        seas_agg = df.groupby('Месяц')['Seasonality_Share'].mean().reset_index()
+        seas_agg['Сез_Сеть'] = seas_agg['Seasonality_Share'] * 100
+        m_full = pd.merge(m_full, seas_agg[['Месяц', 'Сез_Сеть']], on='Месяц', how='left').fillna(0)
+        
+    else:
+        # Fallback 2: Равномерная
+        m_full['Сез_Сеть'] = 100 / 12
+
     fig4 = go.Figure()
+
+    # Сеть - Фиолетовая эталонная (на заднем плане, но яркая)
+    fig4.add_trace(go.Scatter(
+        x=m_full['M'], y=m_full['Сез_Сеть'], name='Сеть', 
+        line=dict(color='#9b59b6', width=2, dash='dot'), mode='lines',
+        hoverinfo='skip'
+    ))
     
     # 2024 - серая пунктирная
     fig4.add_trace(go.Scatter(
@@ -2383,6 +2900,7 @@ with col4:
         d_sign = '+' if delta >= 0 else ''
         hover_texts_sez.append(
             f"<b>{row['M']}</b><br>"
+            f"<span style='color:#9b59b6'>Сеть: {row['Сез_Сеть']:.1f}%</span><br>"
             f"<span style='color:#2ecc71'>2025: {row['Сез_25']:.1f}%</span><br>"
             f"<span style='color:#3498db'>План: {row['Сез_План']:.1f}%</span><br>"
             f"<span style='color:#95a5a6'>2024: {row['Сез_24']:.1f}%</span><br>"
@@ -2406,54 +2924,138 @@ with col4:
     fig4.update_yaxes(tickfont=dict(size=14), ticksuffix="%")
     st.plotly_chart(fig4, use_container_width=True)
 
-# --- РЕДАКТОР ЛИМИТОВ РОСТА (Под графиками) ---
-with st.expander("⚙️ Настройка лимитов роста (%)", expanded=False):
-    st.caption("Оставьте ячейку пустой для снятия лимита (по умолчанию рост не ограничен для Мини форматиов, 6% для остальных). Введенное значение (например 5) означает лимит +5% к 2025 году. Изменения сохраняются автоматически.")
+# --- НАСТРОЙКА (Лимиты и Прирост) ---
+with st.expander("⚙️ Настройка", expanded=False):
+    tab_limits, tab_growth = st.tabs(["📊 Лимиты роста", "📈 Прирост на год"])
     
-    # Загружаем текущие сохраненные лимиты
-    current_limits = load_limits_local()
-    
-    if 'raw_sales' in st.session_state:
-        df_raw = st.session_state['raw_sales']
-        if not df_raw.empty:
-            all_branches = sorted(df_raw['Филиал'].unique())
-            all_depts = sorted(df_raw['Отдел'].unique())
-            
-            # Строим исходный DF для отображения
-            df_lim_ui = pd.DataFrame(index=all_depts, columns=all_branches)
-            
-            # Заполняем
-            for (br, dp), val in current_limits.items():
-                if br in all_branches and dp in all_depts:
-                    df_lim_ui.at[dp, br] = val
-            
-            # Редактор
-            edited_limits_df = st.data_editor(
-                df_lim_ui,
-                key='limits_editor_matrix_main',
-                use_container_width=True,
-                height=400
-            )
-            
-            # АВТОСОХРАНЕНИЕ ОТКЛЮЧЕНО (вызывало циклическое обновление)
-            # Возвращаем кнопку сохранения
-            if st.button("💾 Сохранить изменения лимитов", type="primary"):
-                new_limits_dict = {}
-                for dp in edited_limits_df.index:
-                    for br in edited_limits_df.columns:
-                        val = edited_limits_df.at[dp, br]
-                        if pd.notna(val) and str(val).strip() != '':
-                            try:
-                                f_val = float(val)
-                                new_limits_dict[(br, dp)] = f_val
-                            except:
-                                pass
+    # === ВКЛАДКА 1: ЛИМИТЫ РОСТА ===
+    with tab_limits:
+        st.caption("Оставьте ячейку пустой для снятия лимита. Введенное значение (например 5) означает лимит +5% к 2025 году.")
+        
+        # Загружаем текущие сохраненные лимиты
+        current_limits = load_limits_local()
+        
+        if 'raw_sales' in st.session_state:
+            df_raw = st.session_state['raw_sales']
+            if not df_raw.empty:
+                all_branches = sorted(df_raw['Филиал'].unique())
+                all_depts = sorted(df_raw['Отдел'].unique())
                 
-                if save_limits_local(new_limits_dict):
-                    st.toast("Лимиты сохранены! Обновляем...", icon="✅")
-                    st.rerun()
-    else:
-        st.info("Загрузка данных...")
+                # Строим исходный DF для отображения
+                df_lim_ui = pd.DataFrame(index=all_depts, columns=all_branches)
+                
+                # Заполняем
+                for (br, dp), val in current_limits.items():
+                    if br in all_branches and dp in all_depts:
+                        df_lim_ui.at[dp, br] = val
+                
+                # Редактор
+                edited_limits_df = st.data_editor(
+                    df_lim_ui,
+                    key='limits_editor_matrix_main',
+                    use_container_width=True,
+                    height=400
+                )
+                
+                if st.button("💾 Сохранить лимиты", type="primary", key="save_limits_btn"):
+                    new_limits_dict = {}
+                    for dp in edited_limits_df.index:
+                        for br in edited_limits_df.columns:
+                            val = edited_limits_df.at[dp, br]
+                            if pd.notna(val) and str(val).strip() != '':
+                                try:
+                                    f_val = float(val)
+                                    new_limits_dict[(br, dp)] = f_val
+                                except:
+                                    pass
+                    
+                    if save_limits_local(new_limits_dict):
+                        st.toast("Лимиты сохранены!", icon="✅")
+                        st.rerun()
+        else:
+            st.info("Загрузка данных...")
+    
+    # === ВКЛАДКА 2: ПРИРОСТ НА ГОД ===
+    with tab_growth:
+        st.caption("Годовой прирост для Сопутствующих отделов (Мини, Микро, Интернет). План = Факт 2025 × (1 + Прирост%) × Сезонность")
+        
+        # Используем df_base (полный датасет), чтобы настройки не зависели от фильтров
+        target_df = df_base if 'df_base' in locals() and not df_base.empty else df
+        
+        if not target_df.empty and 'Формат' in target_df.columns:
+            # Фильтруем только Мини, Микро, Интернет форматы
+            network_formats = ['Мини', 'Микро', 'Интернет', 'Интернет магазин']
+            df_network = target_df[target_df['Формат'].isin(network_formats)]
+            
+            if not df_network.empty:
+                # Получаем уникальные филиалы и отделы формата
+                network_branches = sorted(df_network['Филиал'].unique())
+                
+                # Только Сопутствующие отделы
+                if 'Роль' in df_network.columns:
+                    accomp_depts = sorted(df_network[df_network['Роль'] == 'Сопутствующий']['Отдел'].unique())
+                else:
+                    accomp_depts = sorted(df_network['Отдел'].unique())
+                
+                if len(accomp_depts) > 0:
+                    # Загружаем сохраненные приросты
+                    growth_file = os.path.join(DATA_DIR, 'growth_rates.json')
+                    saved_growth = {}
+                    if os.path.exists(growth_file):
+                        try:
+                            with open(growth_file, 'r', encoding='utf-8') as f:
+                                data = json.load(f)
+                                for item in data:
+                                    saved_growth[(item['branch'], item['dept'])] = item['rate']
+                        except:
+                            pass
+                    
+                    # Строим DataFrame для редактора
+                    df_growth_ui = pd.DataFrame(index=accomp_depts, columns=network_branches)
+                    
+                    # Заполняем сохраненные значения
+                    for (br, dp), val in saved_growth.items():
+                        if br in network_branches and dp in accomp_depts:
+                            df_growth_ui.at[dp, br] = val
+                    
+                    # Редактор прироста
+                    edited_growth_df = st.data_editor(
+                        df_growth_ui,
+                        key='growth_editor_matrix',
+                        use_container_width=True,
+                        height=400
+                    )
+                    
+                    if st.button("💾 Сохранить прирост", type="primary", key="save_growth_btn"):
+                        new_growth_list = []
+                        for dp in edited_growth_df.index:
+                            for br in edited_growth_df.columns:
+                                val = edited_growth_df.at[dp, br]
+                                if pd.notna(val) and str(val).strip() != '':
+                                    try:
+                                        f_val = float(val)
+                                        new_growth_list.append({
+                                            'branch': br,
+                                            'dept': dp,
+                                            'rate': f_val
+                                        })
+                                    except:
+                                        pass
+                        
+                        # Сохраняем
+                        try:
+                            with open(growth_file, 'w', encoding='utf-8') as f:
+                                json.dump(new_growth_list, f, ensure_ascii=False, indent=2)
+                            st.toast("Приросты сохранены!", icon="✅")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Ошибка сохранения: {e}")
+                else:
+                    st.info("Нет сопутствующих отделов в выбранных форматах")
+            else:
+                st.info("Нет данных по форматам Мини/Микро/Интернет")
+        else:
+            st.info("Загрузка данных...")
 
 
 # Подготовка таблицы - используем уже рассчитанные колонки из calculate_plan
@@ -2466,15 +3068,18 @@ edit_df = df[['Филиал', 'Отдел', 'Месяц',
               'План_Скорр', 'План_Расч', 'План', 'Рекоменд',
               'Прирост_%', 'Прирост_24_26_%',
               'Сезонность_Факт', 'Сезонность_План',
+              'Площадь_2025', 'Площадь_2026', 'Δ_Площадь_%',
+              'Отдача_План', 'Отдача_2025', 'Δ_Отдача_%',
+              'Формат', 'is_network_format', '_План_Расч_Исх', 'Авто_Корр',
               'Корр', 'Корр_Дельта', 'Final_Weight', 'Правило', 'Роль']].copy()
 
 # Сортировка по месяцам хронологически
 edit_df = edit_df.sort_values(by=['Филиал', 'Отдел', 'Месяц'])
 
 
-# Колонка месяца с числовым префиксом для правильной сортировки (1 янв, 2 фев...)
+# Колонка месяца с числовым префиксом (01 янв) для корректной строковой сортировки ("02" < "10")
 def fmt_month_display(m):
-    return f"{m} {MONTH_MAP_REV[m]}"
+    return f"{m:02d} {MONTH_MAP_REV[m]}"
 
 edit_df['Мес'] = edit_df['Месяц'].apply(fmt_month_display)
 edit_df['Корр±'] = edit_df['Корр_Дельта']
@@ -2482,28 +3087,37 @@ edit_df['Корр±'] = edit_df['Корр_Дельта']
 # Сортировка по числовому месяцу
 edit_df = edit_df.sort_values(by=['Филиал', 'Отдел', 'Мес'])
 
-# Переименовываем для отображения
-edit_df = edit_df.rename(columns={
-    'Выручка_2024': 'Выр.2024',
-    'Выручка_2025': 'Выр.2025',
-    'Выручка_2025_Норм': 'Выр.25(Н)',
-    'План_Скорр': 'План 2026',
-    'План_Расч': 'Расчёт',
-    'План': 'Цель',
-    'Прирост_%': 'Δ%_25',
-    'Прирост_24_26_%': 'Δ%_24',
-    'Сезонность_Факт': 'Сез.Факт',
-    'Сезонность_План': 'Сез.План',
-    'Final_Weight': 'Вес'
-})
+# Отключаем переименование, чтобы вернуть полные названия колонок
+# edit_df = edit_df.rename(columns={
+#     'Выручка_2024': 'Выр.2024',
+#     'Выручка_2025': 'Выр.2025',
+#     'Выручка_2025_Норм': 'Выр.25(Н)',
+#     'План_Скорр': 'План 2026',
+#     'План_Расч': 'Расчёт',
+#     'План': 'Цель',
+#     'Прирост_%': 'Δ%_25',
+#     'Прирост_24_26_%': 'Δ%_24',
+#     'Сезонность_Факт': 'Сез.Факт',
+#     'Сезонность_План': 'Сез.План',
+#     'Final_Weight': 'Вес'
+# })
 
-# Удаляем старую колонку
-edit_df = edit_df.drop(columns=['Корр_Дельта'])
+# Удаляем старую колонку дельты (оставляем только Корр и Корр± для отображения/редактирования)
+# Но нам нужны Корр и Корр_Дельта для логики сохранения! 
+# Поэтому не удаляем их из edit_df, просто не включаем в default view если не надо.
 
-# Порядок колонок как в ноутбуке
-all_columns = ['Филиал', 'Отдел', 'Мес', 'Роль', 'Корр±', 'Корр', 'Рекоменд', 'План 2026', 
-                'Выр.2025', 'Выр.2024', 'Выр.25(Н)', 'Δ%_25', 'Δ%_24', 
-                'Сез.Факт', 'Сез.План', 'Вес', 'Цель', 'Расчёт', 'Правило', 'Месяц']
+# Порядок колонок
+all_columns = ['Филиал', 'Отдел', 'Мес', 'Роль', 'Формат', 'Правило', 
+               'Корр', 'Корр±', 'Авто_Корр',
+               'План_Скорр', 'План_Расч', 'План', '_План_Расч_Исх', 'Рекоменд',
+               'Выручка_2025', 'Выручка_2024', 'Выручка_2025_Норм',
+               'Прирост_%', 'Прирост_24_26_%',
+               'Сезонность_Факт', 'Сезонность_План',
+               'Площадь_2025', 'Площадь_2026', 'Δ_Площадь_%',
+               'Отдача_План', 'Отдача_2025', 'Δ_Отдача_%',
+               'Final_Weight', 'is_network_format', 'Месяц']
+
+# Фильтруем только те что есть (на случай если что-то не расчиталось)
 all_columns = [c for c in all_columns if c in edit_df.columns]
 
 # Применяем выбор колонок из sidebar (sel_columns)
@@ -2537,18 +3151,27 @@ def style_dataframe(df):
     # Создаём стили для каждой ячейки
     styles = pd.DataFrame('', index=df.index, columns=df.columns)
     
-    # Подсветка Δ%_25
-    if 'Δ%_25' in df.columns:
-        styles['Δ%_25'] = df['Δ%_25'].apply(lambda x: 
+    # Подсветка Прирост_% (ex Δ%_25)
+    col_name_growth_25 = 'Прирост_%' 
+    # Fallback to old name if not found (just in case)
+    if col_name_growth_25 not in df.columns and 'Δ%_25' in df.columns:
+        col_name_growth_25 = 'Δ%_25'
+
+    if col_name_growth_25 in df.columns:
+        styles[col_name_growth_25] = df[col_name_growth_25].apply(lambda x: 
             'background-color: #27ae60; color: white' if pd.notna(x) and x > 10 else
             'background-color: #a9dfbf' if pd.notna(x) and x > 0 else
             'background-color: #f5b7b1' if pd.notna(x) and x > -10 else
             'background-color: #e74c3c; color: white' if pd.notna(x) else ''
         )
     
-    # Подсветка Δ%_24
-    if 'Δ%_24' in df.columns:
-        styles['Δ%_24'] = df['Δ%_24'].apply(lambda x: 
+    # Подсветка Прирост_24_26_% (ex Δ%_24)
+    col_name_growth_24 = 'Прирост_24_26_%'
+    if col_name_growth_24 not in df.columns and 'Δ%_24' in df.columns:
+         col_name_growth_24 = 'Δ%_24'
+         
+    if col_name_growth_24 in df.columns:
+        styles[col_name_growth_24] = df[col_name_growth_24].apply(lambda x: 
             'background-color: #27ae60; color: white' if pd.notna(x) and x > 10 else
             'background-color: #a9dfbf' if pd.notna(x) and x > 0 else
             'background-color: #f5b7b1' if pd.notna(x) and x > -10 else
@@ -2568,80 +3191,99 @@ def fmt_num_sign(x):
         return ''
     return f'{x:+,.0f}'.replace(',', ' ')
 
-# Показываем стилизованную таблицу
-styled = edit_df.style.apply(lambda _: style_dataframe(edit_df), axis=None)
-styled = styled.format({
-    'Выр.2024': fmt_num,
-    'Выр.2025': fmt_num,
-    'Выр.25(Н)': fmt_num,
-    'План 2026': fmt_num,
-    'Рекоменд': fmt_num,
-    'Расчёт': fmt_num,
-    'Цель': fmt_num,
-    'Δ%_25': '{:.1f}',
-    'Δ%_24': '{:.1f}',
-    'Сез.Факт': '{:.1f}',
-    'Сез.План': '{:.1f}',
-    'Вес': '{:.3f}',
-    'Корр': fmt_num,
-    'Корр±': fmt_num_sign,
-}, na_rep='')
+# ========== ПОДГОТОВКА ДАННЫХ ДЛЯ ОТОБРАЖЕНИЯ ==========
+# Создаем отдельный DataFrame для отображения (display_df), 
+# в котором числа превращются в красивые строки (1 000 000) и добавляется подсветка (цветом текста)
 
-# Используем st.data_editor для редактирования Корр и Корр±
-# Для красоты превращаем нередактируемые числа в текст с разделителями и псевдо-выравниванием
 display_df = edit_df.copy()
-static_num_cols = ['Выр.2024', 'Выр.2025', 'Выр.25(Н)', 'План 2026', 'Рекоменд', 'Расчёт', 'Цель']
+
+# 1. Форматирование больших чисел (с пробелами)
+static_num_cols = ['Выручка_2024', 'Выручка_2025', 'Выручка_2025_Norm', 
+                  'План_Скорр', 'План_Расч', '_План_Расч_Исх', 'Рекоменд', 'План',
+                  'Отдача_План', 'Отдача_2025']
 
 def fmt_right(x):
     if pd.isna(x): return ""
-    # Обычный пробел или узкий для разделителя
-    s = f"{x:,.0f}".replace(",", " ")
-    # U+2007 (Figure Space) имеет ширину цифры - используем для отступа слева
-    # чтобы визуально выровнять по правому краю в текстовой колонке
-    return s.rjust(12, '\u2007')
+    try:
+        s = f"{float(x):,.0f}".replace(",", " ")
+        return s.rjust(12, '\u2007')
+    except:
+        return str(x)
 
 for col in static_num_cols:
     if col in display_df.columns:
         display_df[col] = display_df[col].apply(fmt_right)
 
-# Определяем нередактируемые колонки (все кроме Корр и Корр±)
+# ========== ЕДИНАЯ РЕДАКТИРУЕМАЯ ТАБЛИЦА ==========
+# Подготовка данных (как раньше, с эмодзи)
+display_df = edit_df.copy()
+
+# Форматирование для редактора
+ignore_cols = ['Филиал', 'Отдел', 'Мес', 'Месяц', 'Роль', 'Формат', 'Правило', 'is_network_format', 'Final_Weight']
+editable_cols = ['Корр', 'Корр±']
+
+def fmt_abs_editor(x):
+    if pd.isna(x): return ""
+    try: return f"{float(x):,.0f}".replace(",", " ").rjust(12, '\u2007')
+    except: return str(x)
+
+def fmt_pct_editor(x):
+    if pd.isna(x): return ""
+    try:
+        val = float(x)
+        s = f"{val:,.1f}".replace(",", " ")
+        # Градиентная шкала: 🟢 → 🟡 → ⚪ → 🟠 → 🔴
+        if val >= 10:
+            icon = "🟢"  # Ярко-зеленый (сильный рост)
+        elif val >= 5:
+            icon = "🟡"  # Желтый (умеренный рост)
+        elif val > 0:
+            icon = "⚪"  # Белый (слабый рост)
+        elif val == 0:
+            return s     # Без иконки
+        elif val > -10:
+            icon = "🟠"  # Оранжевый (небольшое падение)
+        else:
+            icon = "🔴"  # Красный (значительное падение, < -10%)
+        
+        sign = "+" if val > 0 else ""
+        return f"{icon} {sign}{s}"
+    except: return str(x)
+
+for col in display_df.columns:
+    if col in editable_cols or col in ignore_cols: continue
+    is_pct = '%' in col or 'Сезонность' in col or 'Прирост' in col or 'Δ' in col
+    if is_pct:
+        display_df[col] = display_df[col].apply(fmt_pct_editor)
+    elif pd.api.types.is_numeric_dtype(edit_df[col]):
+        display_df[col] = display_df[col].apply(fmt_abs_editor)
+
+# Конфиг колонок
 disabled_cols = [c for c in edit_df.columns if c not in ['Корр', 'Корр±']]
+col_config_dynamic = {}
+for col in display_df.columns:
+    if col in editable_cols:
+        if col == 'Корр': col_config_dynamic[col] = st.column_config.NumberColumn("Корр", format="%.0f")
+        else: col_config_dynamic[col] = st.column_config.NumberColumn("Корр±", format="%+d")
+    elif col in ignore_cols: pass
+    else: col_config_dynamic[col] = st.column_config.TextColumn(col)
 
 edited_df = st.data_editor(
     display_df,
     use_container_width=True,
-    height=550,
+    height=600,
     hide_index=True,
     disabled=disabled_cols,
-    column_config={
-        "Корр": st.column_config.NumberColumn(
-            "Корр",
-            help="Абсолютное значение плана. Пустое = нет корр.",
-            format="%.0f",
-            default=None
-        ),
-        "Корр±": st.column_config.NumberColumn(
-            "Корр±",
-            help="Добавка/вычет к плану. Пустое = нет корр.",
-            format="%+d",
-            default=None
-        ),
-        # Статические колонки показываем как текст
-        "Выр.2024": st.column_config.TextColumn("Выр.2024", width="small"),
-        "Выр.2025": st.column_config.TextColumn("Выр.2025", width="small"),
-        "Выр.25(Н)": st.column_config.TextColumn("Выр.25(Н)", width="small"),
-        "План 2026": st.column_config.TextColumn("План 2026", width="small"),
-        "Рекоменд": st.column_config.TextColumn("Рекоменд", width="small"),
-        "Расчёт": st.column_config.TextColumn("Расчёт", width="small"),
-        "Цель": st.column_config.TextColumn("Цель", width="small"),
-        
-        "Δ%_25": st.column_config.NumberColumn("Δ%_25", format="%.1f"),
-        "Δ%_24": st.column_config.NumberColumn("Δ%_24", format="%.1f"),
-        "Сез.Факт": st.column_config.NumberColumn("Сез.Факт", format="%.1f"),
-        "Сез.План": st.column_config.NumberColumn("Сез.План", format="%.1f"),
-    },
+    column_config=col_config_dynamic,
     key="main_data_editor"
 )
+    
+# Для логики сохранения нам нужно добавить в edited_df недостающие колонки (месяц числом), 
+# чтобы логика внизу (iterrows) работала корректно.
+# edited_df сейчас содержит только ['Филиал', 'Отдел', 'Мес', 'Корр', 'Корр±']
+# Но логике сохранения нужны 'Месяц' (число) или умение парсить 'Мес'.
+# Код ниже ("for _, row in edited_df.iterrows()") уже умеет парсить 'Мес', так что всё ок.
+
 
 # Автосохранение корректировок из редактируемой таблицы
 # Умное сохранение корректировок (Merge изменений)
@@ -2673,36 +3315,67 @@ for _, row in edited_df.iterrows():
     dept = row['Отдел']
     key = (branch, dept, month)
     
-    # Текущие значения в редакторе
-    corr_val = row.get('Корр')
-    delta_val = row.get('Корр±')
+    # Получаем существующую запись (если есть)
+    old_item = corrections_map.get(key)
+    old_corr = old_item.get('corr') if old_item else None
+    old_delta = old_item.get('delta') if old_item else None
     
-    has_corr = pd.notna(corr_val) if 'Корр' in edited_df.columns else False
-    has_delta = pd.notna(delta_val) if 'Корр±' in edited_df.columns else False
-    
-    if has_corr or has_delta:
-        new_corr = int(corr_val) if has_corr else None
-        new_delta = int(delta_val) if has_delta else None
-        
-        # Проверяем, изменилось ли что-то (сравниваем только значимые поля)
-        old_item = corrections_map.get(key)
-        old_corr = old_item.get('corr') if old_item else None
-        old_delta = old_item.get('delta') if old_item else None
-        
-        if old_corr != new_corr or old_delta != new_delta:
+    current_corr = old_corr
+    current_delta = old_delta
+
+    # Обработка Корр
+    if 'Корр' in edited_df.columns:
+        # Колонка видна - принимаем значение из редактора (число или очистка)
+        raw_val = row.get('Корр')
+        if pd.notna(raw_val):
+            try:
+                val = float(raw_val)
+                rounded_val = round(val / 10000) * 10000
+                if val != 0 and rounded_val == 0:
+                    current_corr = None # Явное удаление (например ввели 0)
+                else:
+                    current_corr = int(rounded_val)
+            except:
+                current_corr = None
+        else:
+            # Колонка есть, но значение пустое -> пользователь очистил
+            current_corr = None
+            
+    # Обработка Корр±
+    if 'Корр±' in edited_df.columns:
+        # Колонка видна
+        raw_val = row.get('Корр±')
+        if pd.notna(raw_val):
+            try:
+                val = float(raw_val)
+                rounded_val = round(val / 10000) * 10000
+                if val != 0 and rounded_val == 0:
+                    current_delta = None
+                else:
+                    current_delta = int(rounded_val)
+            except:
+                current_delta = None
+        else:
+            # Колонка есть, но значение пустое -> пользователь очистил
+            current_delta = None
+            
+    # Проверяем, изменилось ли что-то
+    if current_corr != old_corr or current_delta != old_delta:
+        # Если оба значения пустые -> удаляем запись
+        if current_corr is None and current_delta is None:
+            if key in corrections_map:
+                del corrections_map[key]
+                changes_detected = True
+        else:
+            # Обновляем запись (сохраняя то что могло быть скрыто но перенесено через current_*)
             new_item = {
                 'branch': branch,
                 'dept': dept,
                 'month': month,
-                'corr': new_corr,
-                'delta': new_delta
+                'corr': current_corr,
+                'delta': current_delta
             }
             corrections_map[key] = new_item
-            changes_detected = True
-    else:
-        # Если корректировки нет (пусто), но она БЫЛА в файле -> удаляем (пользователь стер)
-        if key in corrections_map:
-            del corrections_map[key]
             changes_detected = True
 
 if changes_detected:

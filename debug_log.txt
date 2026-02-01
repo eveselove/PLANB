@@ -1,0 +1,5 @@
+=== DEBUG START 2026-02-01 20:11:37.036137 ===
+Branch: Владимир Лента
+Annual Target: 91470000
+Annual Forecast: 3856591428.779423
+Global Growth: 0.023717835215162898
