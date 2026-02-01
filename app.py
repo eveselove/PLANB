@@ -15,6 +15,14 @@ warnings.filterwarnings('ignore')
 
 st.set_page_config(page_title="План 2026", page_icon="📊", layout="wide", initial_sidebar_state="expanded")
 
+# Убираем лишние отступы Streamlit
+st.markdown("""
+<style>
+    .block-container {padding-top: 1rem; padding-bottom: 0rem;}
+    div[data-testid="stVerticalBlock"] > div {gap: 0.3rem;}
+</style>
+""", unsafe_allow_html=True)
+
 # ============================================================================
 # КОНФИГУРАЦИЯ
 # ============================================================================
@@ -105,14 +113,26 @@ def save_limits_local(limits_dict):
         return False
 
 def load_limits_local():
+    """Загружает лимиты макс. роста. Возвращает dict с ключами-кортежами (Branch, Dept)."""
     try:
         filepath = os.path.join(DATA_DIR, 'limits.json')
         if not os.path.exists(filepath):
             return {}
         with open(filepath, 'r', encoding='utf-8') as f:
             data = json.load(f)
-        return data.get('limits', {})
-    except:
+        raw = data.get('limits', {})
+        limits = {}
+        for k, v in raw.items():
+            if isinstance(k, str) and '|||' in k:
+                parts = k.split('|||')
+                if len(parts) >= 2:
+                    limits[(parts[0], parts[1])] = v
+            else:
+                # На случай, если ключи уже хранятся иначе или это legacy
+                limits[k] = v
+        return limits
+    except Exception as e:
+        print(f"Error loading limits: {e}")
         return {}
 
 # ============================================================================
@@ -314,8 +334,10 @@ def apply_smooth_growth(df, dept_name, quarter_progress):
     if not dec_mask.any():
         return set()
     
-    # Сезонность по отделу
-    dept_network = df[df['Отдел'] == dept_name].groupby('Месяц')['Выручка_2025'].sum()
+    # Сезонность по отделу (используем Rev_2025, так как Выручка_2025 появляется позже)
+    col_rev = 'Rev_2025' if 'Rev_2025' in df.columns else 'Выручка_2025'
+    
+    dept_network = df[df['Отдел'] == dept_name].groupby('Месяц')[col_rev].sum()
     total_network = dept_network.sum()
     seasonality = {m: dept_network.get(m, 0) / total_network if total_network > 0 else 1/12 for m in range(1, 13)}
     
@@ -442,7 +464,8 @@ def apply_min_plan_network(df):
     for (branch, month), group_idx in df[network_mask].groupby(['Филиал', 'Месяц']).groups.items():
         indices = list(group_idx)
         
-        rev_2025 = df.loc[indices, 'Выручка_2025'].fillna(0)
+        col_rev = 'Rev_2025' if 'Rev_2025' in df.columns else 'Выручка_2025'
+        rev_2025 = df.loc[indices, col_rev].fillna(0)
         plan_skorr = df.loc[indices, 'План_Скорр'].fillna(0)
         
         min_plan = (rev_2025 * MIN_GROWTH).apply(ceil_step)
@@ -582,29 +605,12 @@ def apply_load_coefficients(df, role_coefficients):
     return result
 
 
-def calculate_plan(df_sales, corrections=None):
+def calculate_plan(df_sales, corrections=None, role_coefficients=None, limits=None):
+    """
+    Полный расчёт плана с учетом лимитов роста.
+    """
+    # ... (код функции) ...
 
-    """
-    ГЛАВНАЯ ФУНКЦИЯ РАСЧЁТА ПЛАНА
-    
-    План филиала спущен сверху (из Google Sheets), наша задача — распределить его по отделам.
-    
-    Логика:
-    1. Загрузка целевых планов филиалов из Google Sheets
-    2. Загрузка правил (Только 2025, 2024-2025, Формат, Структура только формата, Не считаем план)
-    3. Нормализация для филиалов на ремонте
-    4. Расчёт весов отделов (сезонность × база)
-    5. Распределение плана по отделам пропорционально весам
-    6. Применение корректировок с перераспределением остатка
-    
-    Args:
-        df_sales: DataFrame с продажами (Филиал, Отдел, Месяц, Год, Выручка)
-        corrections: Список корректировок [{'branch', 'dept', 'month', 'corr', 'delta'}]
-    
-    Returns:
-        DataFrame с рассчитанным планом (100% сходимость к целевому плану филиала)
-    """
-    
     # ========== ПОДГОТОВКА ДАННЫХ ==========
     df_s = df_sales.copy()
     df_s['Месяц'] = df_s['Месяц'].apply(parse_month) if df_s['Месяц'].dtype == 'object' else df_s['Месяц']
@@ -1002,11 +1008,26 @@ def calculate_plan(df_sales, corrections=None):
     else:
         result = df_master
 
+    # ========== ШАГ 12.5: Промежуточные правила (Минимумы, Плавный рост) ==========
+    # Для работы apply функций нужна колонка План_Скорр (они работают с ней)
+    result['План_Скорр'] = result['План_Расч'].copy()
+    
+    apply_doors_smooth_growth(result)
+    apply_kitchen_smooth_growth(result)
+    result = apply_min_plan_network(result)
+    
+    # 4. Компрессор (перераспределение по ролям)
+    if role_coefficients:
+        result = apply_load_coefficients(result, role_coefficients)
+    
+    # Возвращаем изменения в переменную расчета для балансировки
+    result['План_Расч'] = result['План_Скорр']
+
     # ========== ШАГ 13: ФИНАЛЬНАЯ БАЛАНСИРОВКА ==========
-    # Проверяем сходимость по каждому филиалу/месяцу и добавляем остаток
+    # Проверяем сходимость по каждому филиалу/месяцу и перераспределяем остаток
     
     for (branch, month), group in result.groupby(['Филиал', 'Месяц']):
-        idx = group.index  # индексы строк этой группы
+        idx = group.index
         
         target = result.loc[idx, 'План'].iloc[0]
         if pd.isna(target):
@@ -1019,16 +1040,124 @@ def calculate_plan(df_sales, corrections=None):
         if diff == 0:
             continue
         
-        # Находим активные отделы (с планом > 0) — из актуального result
-        active_mask = result.loc[idx, 'План_Расч'] > 0
+        # Находим активные отделы
+        # ИСКЛЮЧАЯ те, которые имеют ручные корректировки (мы должны сохранить их значения)
+        group_slice = result.loc[idx]
+        fixed_mask = has_correction(group_slice)
+        
+        active_mask = (group_slice['План_Расч'] > 0) & (~fixed_mask)
         active_idx = idx[active_mask]
         
         if len(active_idx) == 0:
-            active_idx = idx
+            active_idx = idx 
         
-        # Добавляем остаток на отдел с максимальным планом
-        max_idx = result.loc[active_idx, 'План_Расч'].idxmax()
-        result.loc[max_idx, 'План_Расч'] += diff
+        # === ИТЕРАТИВНОЕ РАСПРЕДЕЛЕНИЕ С УЧЕТОМ ЛИМИТОВ (WATER FILLING) ===
+        
+        # Получаем данные 2025 года для расчета лимитов
+        rev_col = 'Rev_2025' if 'Rev_2025' in result.columns else 'Выручка_2025'
+        
+        active_candidates = result.loc[active_idx].copy()
+        
+        # Функция определения лимита для конкретной строки
+        def get_max_plan(row):
+            # Если лимиты не переданы - нет ограничений
+            if not limits:
+                return float('inf')
+            
+            branch_name = row['Филиал']
+            dept_name = row['Отдел']
+            
+            # Ключ может быть кортежем (Branch, Dept) или строкой
+            # Пробуем форматы хранения
+            limit_val = limits.get((branch_name, dept_name))
+            
+            # Если в таблице пусто (None) -> нет лимита
+            if limit_val is None or limit_val == '':
+                return float('inf')
+                
+            try:
+                pct = float(limit_val)
+            except (ValueError, TypeError):
+                return float('inf')
+            
+            base_rev = row.get(rev_col, 0)
+            if base_rev <= 0:
+                return float('inf') 
+            
+            return base_rev * (1 + pct / 100.0)
+
+        current_limits_series = active_candidates.apply(get_max_plan, axis=1)
+        
+        # Начальное состояние
+        participants = list(active_idx)
+        remaining_diff = diff
+        
+        while abs(remaining_diff) > 1 and participants:
+            # Текущие веса участников
+            current_parts = result.loc[participants]
+            weights = current_parts.get('Final_Weight', pd.Series(1, index=participants))
+            
+            w_sum = weights.sum()
+            if w_sum == 0:
+                weights = current_parts['План_Расч']
+                w_sum = weights.sum()
+            
+            shares = (weights / w_sum) if w_sum > 0 else pd.Series(1.0 / len(participants), index=participants)
+            
+            # Попытка распределить
+            to_distribute = shares * remaining_diff
+            
+            overflow_indices = []
+            
+            if remaining_diff > 0:
+                predicted_plan = result.loc[participants, 'План_Расч'] + to_distribute
+                
+                # Сравниваем с лимитом
+                subset_limits = current_limits_series.loc[participants]
+                overshoot = predicted_plan > subset_limits
+                
+                if overshoot.any():
+                    overflow_indices = overshoot[overshoot].index.tolist()
+                    for o_idx in overflow_indices:
+                        limit_val = subset_limits.loc[o_idx]
+                        current_val = result.loc[o_idx, 'План_Расч']
+                        added = max(0, limit_val - current_val)
+                        result.loc[o_idx, 'План_Расч'] = limit_val
+                        remaining_diff -= added
+            
+            if not overflow_indices:
+                result.loc[participants, 'План_Расч'] += to_distribute
+                remaining_diff = 0
+                break
+            else:
+                for o_idx in overflow_indices:
+                    participants.remove(o_idx)
+        
+        # Если цикл завершился (все переполнились), а remain_diff остался
+        if abs(remaining_diff) > 1 and not participants:
+             # Все переполнились. Принудительно размазываем остаток
+             all_active = active_idx
+             weights = result.loc[all_active, 'Final_Weight']
+             w_sum = weights.sum()
+             dist_weights = (weights / w_sum) if w_sum > 0 else pd.Series(1, index=all_active)
+             result.loc[all_active, 'План_Расч'] += remaining_diff * dist_weights
+
+        # Округление (Largest Remainder Method)
+        # Применяем ко всем активным, так как после итераций у нас могут быть дроби
+        current_vals = result.loc[active_idx, 'План_Расч']
+        rounded_vals = current_vals.round(0).astype(int)
+        result.loc[active_idx, 'План_Расч'] = rounded_vals
+        
+        # Остаток от округления - на макс вес (среди незафиксированных лимитом, если возможно, или просто макс вес)
+        # Упрощаем: кидаем на макс вес из всех активных
+        new_diff = target - result.loc[idx, 'План_Расч'].sum()
+        if new_diff != 0:
+            candidates_w = result.loc[active_idx, 'Final_Weight']
+            if candidates_w.sum() == 0:
+                 candidates_w = result.loc[active_idx, 'План_Расч']
+            
+            max_w_idx = candidates_w.idxmax()
+            result.loc[max_w_idx, 'План_Расч'] += new_diff
 
     # ========== ШАГ 14: Финализация ==========
     result['План_Скорр'] = result['План_Расч'].copy()
@@ -1340,68 +1469,12 @@ def get_plan_data(role_coefficients=None):
         df_sales = prepare_baseline(df_sales, df_area)
     
     corrections = load_corrections_local()
-    result = calculate_plan(df_sales, corrections=corrections)
+    limits = load_limits_local()
     
-    if result.empty:
-        return result
-    
-    # ========== ДОПОЛНИТЕЛЬНАЯ ОБРАБОТКА (ИЗ PANEL ДАШБОРДА) ==========
-    
-    # 1. Плавный рост для Дверей (если есть декабрьская корректировка)
-    doors_affected = apply_doors_smooth_growth(result)
-    if doors_affected:
-        st.info(f"🚪 Плавный рост Дверей: {len(doors_affected)} групп")
-    
-    # 2. Плавный рост для Кухни (если есть декабрьская корректировка)
-    kitchen_affected = apply_kitchen_smooth_growth(result)
-    if kitchen_affected:
-        st.info(f"🍳 Плавный рост Кухни: {len(kitchen_affected)} групп")
-    
-    # 3. Минимальный план для сетевых форматов (Мини/Микро/Интернет)
-    result = apply_min_plan_network(result)
-    
-    # 4. Компрессор (перераспределение нагрузки по ролям)
-    if role_coefficients:
-        result = apply_load_coefficients(result, role_coefficients)
-    
-    # 5. Пересчёт сезонности после всех корректировок
-    result = calc_seasonality(result)
-    
-    # 6. ФИНАЛЬНАЯ БАЛАНСИРОВКА — после всех обработок
-    # Гарантирует 100% сходимость к целевому плану филиала
-    step = CONFIG['rounding_step']
-    for (branch, month), group in result.groupby(['Филиал', 'Месяц']):
-        idx = group.index
-        target = result.loc[idx, 'План'].iloc[0]
-        if pd.isna(target):
-            continue
-        target = int(round(target))
-        
-        current_sum = result.loc[idx, 'План_Скорр'].sum()
-        diff = target - current_sum
-        
-        if diff == 0:
-            continue
-        
-        # Находим активные отделы (с планом > 0)
-        active_mask = result.loc[idx, 'План_Скорр'] > 0
-        active_idx = idx[active_mask]
-        
-        if len(active_idx) == 0:
-            active_idx = idx
-        
-        # Добавляем остаток на отдел с максимальным планом
-        max_idx = result.loc[active_idx, 'План_Скорр'].idxmax()
-        result.loc[max_idx, 'План_Скорр'] += diff
+    # Полный цикл расчета теперь внутри calculate_plan
+    result = calculate_plan(df_sales, corrections=corrections, role_coefficients=role_coefficients, limits=limits)
     
     return result
-
-
-
-
-
-
-
 
 
 # ============================================================================
@@ -1409,7 +1482,7 @@ def get_plan_data(role_coefficients=None):
 # ============================================================================
 
 # CSS для компактного сайдбара и синих тегов
-st.markdown("""
+st.markdown('''
 <style>
     /* Ограничение ширины контента для больших экранов */
     .main .block-container {
@@ -1418,22 +1491,40 @@ st.markdown("""
         padding-right: 1rem !important;
     }
     
-    /* Компактный сайдбар - минимальные отступы */
+    /* Компактные таблицы — уменьшенный шрифт и строки */
+    [data-testid="stDataFrame"] table {
+        font-size: 11px !important;
+    }
+    [data-testid="stDataFrame"] th,
+    [data-testid="stDataFrame"] td {
+        padding: 2px 4px !important;
+        line-height: 1.1 !important;
+    }
+    [data-testid="stDataFrame"] th {
+        font-size: 10px !important;
+    }
+    
+    /* Компактный сайдбар - минимальные отступы, заголовок в самом верху */
     [data-testid="stSidebar"] {
         padding-top: 0rem !important;
     }
     [data-testid="stSidebar"] > div:first-child {
-        padding-top: 0.3rem !important;
+        padding-top: 0rem !important;
         padding-left: 0.3rem !important;
         padding-right: 0.3rem !important;
+    }
+    [data-testid="stSidebar"] > div > div:first-child {
+        padding-top: 0rem !important;
+        margin-top: 0rem !important;
     }
     [data-testid="stSidebar"] .block-container {
         padding: 0rem !important;
     }
     [data-testid="stSidebar"] h2 {
-        font-size: 0.75rem !important;
+        font-size: 0.85rem !important;
         margin-bottom: 0.1rem !important;
-        margin-top: 0.1rem !important;
+        margin-top: 0rem !important;
+        padding-top: 0.2rem !important;
     }
     [data-testid="stSidebar"] .stMultiSelect {
         margin-bottom: 0rem !important;
@@ -1481,13 +1572,21 @@ st.markdown("""
         margin-bottom: 0.1rem !important;
     }
     
-    /* Синие теги вместо красных */
+    /* Синие теги и слайдеры вместо красных */
     span[data-baseweb="tag"] {
         background-color: #3498db !important;
         border-color: #2980b9 !important;
     }
     span[data-baseweb="tag"] span {
         color: white !important;
+    }
+    
+    /* Синие слайдеры */
+    [data-testid="stSlider"] > div > div > div > div {
+        background-color: #3498db !important;
+    }
+    [data-testid="stSlider"] [data-baseweb="slider"] [role="slider"] {
+        background-color: #3498db !important;
     }
     
     /* Синяя primary кнопка вместо красной */
@@ -1530,6 +1629,15 @@ st.markdown("""
         margin-bottom: 0rem !important;
     }
     
+    /* Синяя рамка вместо красной для мультиселекта */
+    .stMultiSelect > div > div {
+        border-color: #3498db !important;
+    }
+    .stMultiSelect > div > div:focus-within {
+        border-color: #3498db !important;
+        box-shadow: 0 0 0 1px #3498db !important;
+    }
+    
     /* КНОПКА ОТКРЫТИЯ САЙДБАРА — ВСЕГДА ВИДНА */
     [data-testid="stSidebarCollapseButton"],
     [data-testid="stExpandSidebarButton"],
@@ -1547,9 +1655,13 @@ st.markdown("""
     [data-testid="stSidebarCollapseButton"] svg,
     [data-testid="stExpandSidebarButton"] svg,
     button[aria-label="Expand sidebar"] svg,
-    [data-testid="collapsedControl"] svg {
+    [data-testid="collapsedControl"] svg,
+    [data-testid="stSidebarCollapseButton"] svg path,
+    [data-testid="stExpandSidebarButton"] svg path,
+    [data-testid="collapsedControl"] svg path {
         color: white !important;
         fill: white !important;
+        stroke: white !important;
     }
     [data-testid="stSidebarCollapseButton"]:hover,
     [data-testid="stExpandSidebarButton"]:hover,
@@ -1575,8 +1687,38 @@ st.markdown("""
     [data-testid="stDataFrame"]:-webkit-full-screen > div {
         height: 100% !important;
     }
+    
+    /* Выравнивание числовых колонок по правому краю */
+    [data-testid="stDataEditor"] td,
+    [data-testid="stDataFrame"] td {
+        text-align: right !important;
+    }
+    [data-testid="stDataEditor"] td:first-child,
+    [data-testid="stDataEditor"] td:nth-child(2),
+    [data-testid="stDataEditor"] td:nth-child(3),
+    [data-testid="stDataEditor"] td:nth-child(4),
+    [data-testid="stDataFrame"] td:first-child,
+    [data-testid="stDataFrame"] td:nth-child(2),
+    [data-testid="stDataFrame"] td:nth-child(3),
+    [data-testid="stDataFrame"] td:nth-child(4) {
+        text-align: left !important;
+    }
+    
+    /* Синяя рамка для активной ячейки в data_editor */
+    [data-testid="stDataEditor"] input:focus,
+    [data-testid="stDataEditor"] [contenteditable="true"]:focus,
+    [data-testid="stDataEditor"] *:focus {
+        outline: 2px solid #3498db !important;
+        border-color: #3498db !important;
+        box-shadow: 0 0 0 2px rgba(52, 152, 219, 0.3) !important;
+    }
+    [data-testid="stDataEditor"] td.selected,
+    [data-testid="stDataEditor"] td[aria-selected="true"] {
+        outline: 2px solid #3498db !important;
+        border-color: #3498db !important;
+    }
 </style>
-""", unsafe_allow_html=True)
+''', unsafe_allow_html=True)
 
 # ========== ЗАГРУЗКА ДАННЫХ ПРИ СТАРТЕ СЕССИИ (КАК В COLAB) ==========
 # Данные загружаются ОДИН РАЗ при входе и используются всю сессию
@@ -1592,19 +1734,20 @@ if 'data_loaded' not in st.session_state:
         st.session_state['data_loaded'] = True
         st.session_state['load_time'] = pd.Timestamp.now().strftime('%H:%M:%S')
 
-# Сайдбар - ФИЛЬТРЫ
-st.sidebar.header("📊 Фильтры")
-st.sidebar.caption(f"📅 Данные: {st.session_state.get('load_time', 'N/A')}")
-
-# Кнопка обновления данных из Google Диск
-if st.sidebar.button("🔄 Обновить из Google Диск", type="primary"):
-    # Очищаем session_state для перезагрузки
+# Сайдбар - Кнопка обновления вверху
+if st.sidebar.button("🔄 Обновить", type="primary"):
     for key in ['data_loaded', 'raw_sales', 'rules', 'roles', 'branch_plans', 'areas']:
         if key in st.session_state:
             del st.session_state[key]
     st.cache_data.clear()
     st.rerun()
 
+# Редактор лимитов перенесен в основную часть страницы (под графики)
+pass
+
+# Заголовок и дата
+st.sidebar.header("📊 Фильтры")
+st.sidebar.caption(f"📅 Данные: {st.session_state.get('load_time', 'N/A')}")
 
 # ========== КОМПРЕССОР (Коэффициенты нагрузки) ==========
 with st.sidebar.expander("⚖️ Компрессор (K нагрузки)", expanded=False):
@@ -1677,19 +1820,19 @@ saved_filters = load_filters_local()
 
 st.sidebar.divider()
 
-# Основные фильтры (с учётом сохранённых)
-default_branches = saved_filters.get('branches', all_branches)
-default_depts = saved_filters.get('depts', all_depts)
-default_months = saved_filters.get('months', all_months)
+# Основные фильтры (с учётом сохранённых, по умолчанию пустые = все данные)
+default_branches = saved_filters.get('branches', [])
+default_depts = saved_filters.get('depts', [])
+default_months = saved_filters.get('months', [])
 
-# Валидация (если сохранённые значения устарели)
-default_branches = [b for b in default_branches if b in all_branches] or all_branches
-default_depts = [d for d in default_depts if d in all_depts] or all_depts
-default_months = [m for m in default_months if m in all_months] or all_months
+# Валидация (если сохранённые значения устарели - оставляем только валидные)
+default_branches = [b for b in default_branches if b in all_branches]
+default_depts = [d for d in default_depts if d in all_depts]
+default_months = [m for m in default_months if m in all_months]
 
-sel_branches = st.sidebar.multiselect("Филиал", all_branches, default=default_branches)
-sel_depts = st.sidebar.multiselect("Отдел", all_depts, default=default_depts)
-sel_months = st.sidebar.multiselect("Месяц", all_months, default=default_months, format_func=lambda x: MONTH_MAP_REV[x])
+sel_branches = st.sidebar.multiselect("Филиал", all_branches, default=default_branches, placeholder="Все филиалы")
+sel_depts = st.sidebar.multiselect("Отдел", all_depts, default=default_depts, placeholder="Все отделы")
+sel_months = st.sidebar.multiselect("Месяц", all_months, default=default_months, format_func=lambda x: MONTH_MAP_REV[x], placeholder="Все месяцы")
 
 # Кнопка сохранения фильтров
 if st.sidebar.button("💾 Сохранить фильтры"):
@@ -1715,11 +1858,10 @@ sel_columns = st.sidebar.multiselect("Показать колонки", all_colu
 
 
 
-# Показать на графиках
-st.sidebar.markdown("**Графики**")
-show_2024 = st.sidebar.checkbox("Выручка 2024", value=True)
-show_2025 = st.sidebar.checkbox("Выручка 2025", value=True)
-show_plan = st.sidebar.checkbox("План 2026", value=True)
+# Все линии на графиках всегда показываем
+show_2024 = True
+show_2025 = True
+show_plan = True
 
 # Фильтрация
 df = df_base.copy()
@@ -1781,10 +1923,10 @@ if 'План' in df.columns:
     convergence_ok = abs(deviation) < 1000  # Допустимое отклонение < 1000 руб
     
     if convergence_ok:
-        convergence_msg = f"✅ Сходимость: {deviation:+,.0f} руб ({deviation_pct:+.2f}%)"
+        convergence_msg = f"✅ Сходимость: {deviation:+,.0f} руб ({deviation_pct:+.2f}%)".replace(',', ' ')
         convergence_color = "#27ae60"
     else:
-        convergence_msg = f"⚠️ Расхождение: {deviation:+,.0f} руб ({deviation_pct:+.2f}%)"
+        convergence_msg = f"⚠️ Расхождение: {deviation:+,.0f} руб ({deviation_pct:+.2f}%)".replace(',', ' ')
         convergence_color = "#e74c3c"
 else:
     convergence_msg = "⚠️ Целевые планы не загружены"
@@ -1792,7 +1934,7 @@ else:
     target_total = 0
 
 st.markdown(f"""
-<div style="display:flex; gap:15px; padding:5px 10px; background:#f8f9fa; border-radius:6px; margin-bottom:5px; font-size:13px;">
+<div style="display:flex; gap:15px; padding:5px 10px; background:#f8f9fa; border-radius:6px; font-size:13px;">
     <div><b>План:</b> {total_plan/1e6:,.1f}M</div>
     <div><b>Факт'25:</b> {total_fact/1e6:,.1f}M</div>
     <div><b>Δ:</b> <span style="color:{'green' if total_plan > total_fact else 'red'}">{(total_plan/total_fact-1)*100:+.1f}%</span></div>
@@ -1810,9 +1952,9 @@ if convergence_details:
             conv_data.append({
                 'Филиал': branch,
                 'Месяц': MONTH_MAP_REV.get(month, month),
-                'Цель': f"{vals['target']:,.0f}",
-                'Распред.': f"{vals['distributed']:,.0f}",
-                'Δ': f"{vals['diff']:+,.0f}"
+                'Цель': f"{vals['target']:,.0f}".replace(',', ' '),
+                'Распред.': f"{vals['distributed']:,.0f}".replace(',', ' '),
+                'Δ': f"{vals['diff']:+,.0f}".replace(',', ' ')
             })
         st.dataframe(pd.DataFrame(conv_data), hide_index=True, use_container_width=True)
 
@@ -1820,105 +1962,498 @@ if convergence_details:
 # Пропорции: Динамика(1), Отделы(1.5), Филиалы(1.5), Сезонность(1)
 col1, col2, col3, col4 = st.columns([1, 1.5, 1.5, 1])
 
+
 # 1. График динамики
 with col1:
     st.caption("📈 Динамика")
+    # DEBUG: Проверка данных
+    aggregated_sum = df['План_Скорр'].sum()
+    # st.info(f"Сумма плана (фильтр): {aggregated_sum:,.0f} | Строк: {len(df)}")
     all_months_df = pd.DataFrame({'Месяц': range(1, 13)})
     m_agg = df.groupby('Месяц').agg({
         'План_Скорр': 'sum',
+        'План_Расч': 'sum',
+        'Корр_Дельта': 'sum',
         'Rev_2025': 'sum',
         'Rev_2024': 'sum'
     }).reset_index()
     m_full = pd.merge(all_months_df, m_agg, on='Месяц', how='left').fillna(0)
     m_full['M'] = m_full['Месяц'].map(MONTH_MAP_REV)
     
+    # Расчёт процентов
+    m_full['Δ_План_25'] = np.where(m_full['Rev_2025'] > 0, 
+        (m_full['План_Скорр'] / m_full['Rev_2025'] - 1) * 100, 0)
+    m_full['Δ_25_24'] = np.where(m_full['Rev_2024'] > 0, 
+        (m_full['Rev_2025'] / m_full['Rev_2024'] - 1) * 100, 0)
+    
+    # Форматирование для hover с пробелами (млн)
+    def fmt_mln(val):
+        return f"{val/1e6:.1f} млн".replace(',', ' ')
+    
+    def fmt_sign_mln(val):
+        sign = '+' if val >= 0 else ''
+        return f"{sign}{val/1e6:.1f} млн".replace(',', ' ')
+    
+    def fmt_pct_color(val):
+        sign = '+' if val >= 0 else ''
+        color = '#27ae60' if val >= 0 else '#e74c3c'
+        return f"<span style='color:{color}'>{sign}{val:.1f}%</span>"
+    
+    def fmt_corr_color(val):
+        sign = '+' if val >= 0 else ''
+        color = '#27ae60' if val >= 0 else '#e74c3c'
+        return f"<span style='color:{color}'>{sign}{val/1e6:.1f} млн</span>"
+    
     fig1 = go.Figure()
-    if show_2024:
-        fig1.add_trace(go.Scatter(x=m_full['M'], y=m_full['Rev_2024'], name='24', line=dict(color='#95a5a6', width=1.5), mode='lines'))
-    if show_2025:
-        fig1.add_trace(go.Scatter(x=m_full['M'], y=m_full['Rev_2025'], name='25', line=dict(color='#2ecc71', width=2), mode='lines'))
+    
+    # Сначала добавляем столбцы Плана (на заднем плане)
     if show_plan:
-        fig1.add_trace(go.Scatter(x=m_full['M'], y=m_full['План_Скорр'], name='Пл', line=dict(color='#3498db', width=2), mode='lines+markers', marker=dict(size=3)))
-    fig1.update_layout(margin=dict(l=0,r=0,t=25,b=30), height=320, showlegend=True, legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0, font=dict(size=11)))
-    fig1.update_xaxes(tickfont=dict(size=12), tickangle=0)
-    fig1.update_yaxes(tickfont=dict(size=12), showticklabels=False)
+        fig1.add_trace(go.Bar(
+            x=m_full['M'], y=m_full['План_Скорр'], name='План 26',
+            marker=dict(color='rgba(52, 152, 219, 0.3)', line=dict(color='#3498db', width=1)),
+            hoverinfo='skip'
+        ))
+    
+    # Затем линии поверх столбцов
+    if show_2024:
+        fig1.add_trace(go.Scatter(
+            x=m_full['M'], y=m_full['Rev_2024'], name='Факт 24', 
+            line=dict(color='#bdc3c7', width=1.5, dash='dot'), 
+            mode='lines+markers', marker=dict(size=5, color='#bdc3c7'),
+            hoverinfo='skip'
+        ))
+    if show_2025:
+        fig1.add_trace(go.Scatter(
+            x=m_full['M'], y=m_full['Rev_2025'], name='Факт 25', 
+            line=dict(color='#2ecc71', width=2.5), 
+            mode='lines+markers', marker=dict(size=6, color='#2ecc71'),
+            hoverinfo='skip'
+        ))
+    
+    # Невидимая линия для общего hover
+    hover_texts = []
+    for _, row in m_full.iterrows():
+        text = (
+            f"<b>Месяц: {row['M']}</b><br>"
+            f"<span style='color:#3498db; font-weight:bold'>План: {fmt_mln(row['План_Скорр'])}</span><br>"
+            f"<span style='color:#2ecc71; font-weight:bold'>2025: {fmt_mln(row['Rev_2025'])}</span><br>"
+            f"<span style='color:#95a5a6'>2024: {fmt_mln(row['Rev_2024'])}</span><br>"
+            f"Δ% План/25: {fmt_pct_color(row['Δ_План_25'])}<br>"
+            f"Δ% 25/24: {fmt_pct_color(row['Δ_25_24'])}"
+        )
+        hover_texts.append(text)
+    
+    fig1.add_trace(go.Scatter(
+        x=m_full['M'], y=m_full['План_Скорр'],
+        mode='markers', marker=dict(size=15, opacity=0),
+        hovertext=hover_texts,
+        hoverinfo='text',
+        showlegend=False
+    ))
+    
+    # Аннотации с процентами у основания столбцов
+    if show_plan:
+        y_min = m_full['План_Скорр'].min() * 0.02
+        annotations = []
+        for _, row in m_full.iterrows():
+            val = row['Δ_План_25']
+            color = '#27ae60' if val >= 0 else '#e74c3c'
+            annotations.append(dict(
+                x=row['M'], y=y_min,
+                text=f"<b>{val:+.0f}%</b>",
+                showarrow=False,
+                font=dict(size=14, color=color),
+                bgcolor='rgba(255,255,255,0.85)',
+                borderpad=2
+            ))
+        fig1.update_layout(annotations=annotations)
+    
+    fig1.update_layout(
+        margin=dict(l=0,r=0,t=10,b=30), height=320, 
+        showlegend=True, 
+        legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="left", x=0, font=dict(size=14)),
+        hoverlabel=dict(bgcolor='white', font_size=16),
+        hovermode='x'
+    )
+    fig1.update_xaxes(tickfont=dict(size=14), tickangle=0)
+    fig1.update_yaxes(tickfont=dict(size=14), showticklabels=False)
     st.plotly_chart(fig1, use_container_width=True)
 
 # 2. Таблица по отделам (числа прироста)
 with col2:
     st.caption("🔥 Отделы %")
-    p = df.groupby(['Отдел', 'Месяц']).agg({'План_Скорр': 'sum', 'Rev_2025': 'sum'}).reset_index()
+    # Агрегация данных по отделам и месяцам
+    p = df.groupby(['Отдел', 'Месяц']).agg({
+        'План_Скорр': 'sum', 'Rev_2025': 'sum', 'Rev_2024': 'sum'
+    }).reset_index()
     p['G'] = np.where(p['Rev_2025'] > 0, ((p['План_Скорр'] / p['Rev_2025']) - 1) * 100, 0)
+    p['Δ_25_24'] = np.where(p['Rev_2024'] > 0, ((p['Rev_2025'] / p['Rev_2024']) - 1) * 100, 0)
+    
     pivot = p.pivot(index='Отдел', columns='Месяц', values='G')
+    pivot_plan = p.pivot(index='Отдел', columns='Месяц', values='План_Скорр')
+    pivot_25 = p.pivot(index='Отдел', columns='Месяц', values='Rev_2025')
+    pivot_24 = p.pivot(index='Отдел', columns='Месяц', values='Rev_2024')
+    pivot_d25_24 = p.pivot(index='Отдел', columns='Месяц', values='Δ_25_24')
+    
     for i in range(1, 13):
         if i not in pivot.columns: pivot[i] = 0
-    pivot = pivot[range(1, 13)].fillna(0)
+        if i not in pivot_plan.columns: pivot_plan[i] = 0
+        if i not in pivot_25.columns: pivot_25[i] = 0
+        if i not in pivot_24.columns: pivot_24[i] = 0
+        if i not in pivot_d25_24.columns: pivot_d25_24[i] = 0
     
-    # Динамическая высота: 22px на отдел, минимум 80, максимум 320
-    n_depts = len(pivot.index)
-    heatmap_height_depts = min(320, max(80, n_depts * 22))
+    # Сортировка по алфавиту (А->Я)
+    pivot = pivot[range(1, 13)].fillna(0).sort_index(ascending=True)
+    pivot_plan = pivot_plan[range(1, 13)].fillna(0).sort_index(ascending=True)
+    pivot_25 = pivot_25[range(1, 13)].fillna(0).sort_index(ascending=True)
+    pivot_24 = pivot_24[range(1, 13)].fillna(0).sort_index(ascending=True)
+    pivot_d25_24 = pivot_d25_24[range(1, 13)].fillna(0).sort_index(ascending=True)
     
-    # Plotly heatmap - компактный
+    # Добавляем колонку Итого по отделам
+    pivot_total = df.groupby('Отдел').agg({'План_Скорр': 'sum', 'Rev_2025': 'sum', 'Rev_2024': 'sum'})
+    pivot_total['Σ'] = np.where(pivot_total['Rev_2025'] > 0, 
+        ((pivot_total['План_Скорр'] / pivot_total['Rev_2025']) - 1) * 100, 0)
+    pivot['Σ'] = pivot_total['Σ']
+    
+    # Добавляем строку ИТОГО внизу только если больше 1 строки
+    is_single_row = len(pivot) <= 1
+    
+    if not is_single_row:
+        total_row_plan = pivot_plan.sum()
+        total_row_25 = pivot_25.sum()
+        total_row_24 = pivot_24.sum()
+        total_row_g = pd.Series({m: ((total_row_plan[m] / total_row_25[m]) - 1) * 100 if total_row_25[m] > 0 else 0 for m in range(1, 13)})
+        total_row_d25_24 = pd.Series({m: ((total_row_25[m] / total_row_24[m]) - 1) * 100 if total_row_24[m] > 0 else 0 for m in range(1, 13)})
+        
+        # Итого за год
+        year_plan = total_row_plan.sum()
+        year_25 = total_row_25.sum()
+        total_sigma = ((year_plan / year_25) - 1) * 100 if year_25 > 0 else 0
+        
+        pivot.loc['ИТОГО'] = list(total_row_g.values) + [total_sigma]
+        pivot_plan.loc['ИТОГО'] = total_row_plan.values
+        pivot_25.loc['ИТОГО'] = total_row_25.values
+        pivot_24.loc['ИТОГО'] = total_row_24.values
+        pivot_d25_24.loc['ИТОГО'] = total_row_d25_24.values
+    
+    # Создаём кастомный hover текст
+    month_labels = [MONTH_MAP_REV[i] for i in range(1, 13)] + ['Σ']
+    hover_texts = []
+    for dept in pivot.index:
+        row_texts = []
+        for m in range(1, 13):
+            plan_val = pivot_plan.loc[dept, m] / 1e6
+            f25_val = pivot_25.loc[dept, m] / 1e6
+            f24_val = pivot_24.loc[dept, m] / 1e6
+            g_val = pivot.loc[dept, m]
+            d25_24 = pivot_d25_24.loc[dept, m]
+            
+            g_color = '#27ae60' if g_val >= 0 else '#e74c3c'
+            d_color = '#27ae60' if d25_24 >= 0 else '#e74c3c'
+            g_sign = '+' if g_val >= 0 else ''
+            d_sign = '+' if d25_24 >= 0 else ''
+            
+            text = (
+                f"<b>{dept[:20]}</b><br>"
+                f"<b>{MONTH_MAP_REV[m]}</b><br>"
+                f"<span style='color:#3498db'>План: {plan_val:.1f} млн</span><br>"
+                f"<span style='color:#2ecc71'>2025: {f25_val:.1f} млн</span><br>"
+                f"<span style='color:#95a5a6'>2024: {f24_val:.1f} млн</span><br>"
+                f"<span style='color:{g_color}'>Δ% П/25: {g_sign}{g_val:.0f}%</span><br>"
+                f"<span style='color:{d_color}'>Δ% 25/24: {d_sign}{d25_24:.0f}%</span>"
+            )
+            row_texts.append(text)
+        
+        # Итого колонка - полная информация как для месяцев
+        year_plan = pivot_plan.loc[dept].sum() / 1e6
+        year_25 = pivot_25.loc[dept].sum() / 1e6
+        year_24 = pivot_24.loc[dept].sum() / 1e6
+        year_g = pivot.loc[dept, 'Σ']
+        year_d25_24 = ((pivot_25.loc[dept].sum() / pivot_24.loc[dept].sum()) - 1) * 100 if pivot_24.loc[dept].sum() > 0 else 0
+        
+        g_color = '#27ae60' if year_g >= 0 else '#e74c3c'
+        d_color = '#27ae60' if year_d25_24 >= 0 else '#e74c3c'
+        g_sign = '+' if year_g >= 0 else ''
+        d_sign = '+' if year_d25_24 >= 0 else ''
+        
+        row_texts.append(
+            f"<b>{dept[:20]}</b><br>"
+            f"<b>ИТОГО</b><br>"
+            f"<span style='color:#3498db'>План: {year_plan:.1f} млн</span><br>"
+            f"<span style='color:#2ecc71'>2025: {year_25:.1f} млн</span><br>"
+            f"<span style='color:#95a5a6'>2024: {year_24:.1f} млн</span><br>"
+            f"<span style='color:{g_color}'>Δ% П/25: {g_sign}{year_g:.0f}%</span><br>"
+            f"<span style='color:{d_color}'>Δ% 25/24: {d_sign}{year_d25_24:.0f}%</span>"
+        )
+        hover_texts.append(row_texts)
+    
+    # Plotly heatmap
     fig_h1 = go.Figure(data=go.Heatmap(
         z=pivot.values,
-        x=[MONTH_MAP_REV[i] for i in range(1, 13)],
-        y=[d[:8] for d in pivot.index.tolist()],  # Обрезаем длинные названия
-        colorscale='RdYlGn',
+        x=month_labels,
+        y=[d[:12] for d in pivot.index.tolist()],
+        colorscale=[[0, '#e74c3c'], [0.3, '#f5b7b1'], [0.5, '#ffffff'], [0.7, '#abebc6'], [1, '#27ae60']],
         zmin=-20, zmax=20,
         text=pivot.values.round(0).astype(int),
         texttemplate="%{text}",
-        textfont={"size": 11},
-        showscale=False
+        textfont={"size": 9},
+        showscale=False,
+        hovertext=hover_texts,
+        hoverinfo='text'
     ))
-    fig_h1.update_layout(margin=dict(l=0,r=0,t=0,b=0), height=heatmap_height_depts)
-    fig_h1.update_xaxes(tickfont=dict(size=11))
-    fig_h1.update_yaxes(tickfont=dict(size=11))
+    # Динамическая высота (не более 320px)
+    row_height = 30
+    min_height = 100
+    calc_height = min(320, max(min_height, len(pivot) * row_height + 50))
+    
+    fig_h1.update_layout(margin=dict(l=0,r=0,t=10,b=30), height=calc_height, hoverlabel=dict(bgcolor='white', font_size=16))
+    fig_h1.update_xaxes(tickfont=dict(size=14), side='bottom')
+    fig_h1.update_yaxes(tickfont=dict(size=10), autorange='reversed')
     st.plotly_chart(fig_h1, use_container_width=True)
 
 # 3. Таблица по филиалам (числа прироста)
 with col3:
     st.caption("🏪 Филиалы %")
-    p_br = df.groupby(['Филиал', 'Месяц']).agg({'План_Скорр': 'sum', 'Rev_2025': 'sum'}).reset_index()
+    p_br = df.groupby(['Филиал', 'Месяц']).agg({'План_Скорр': 'sum', 'Rev_2025': 'sum', 'Rev_2024': 'sum'}).reset_index()
     p_br['G'] = np.where(p_br['Rev_2025'] > 0, ((p_br['План_Скорр'] / p_br['Rev_2025']) - 1) * 100, 0)
+    p_br['Δ_25_24'] = np.where(p_br['Rev_2024'] > 0, ((p_br['Rev_2025'] / p_br['Rev_2024']) - 1) * 100, 0)
+    
     pivot_br = p_br.pivot(index='Филиал', columns='Месяц', values='G')
+    pivot_br_plan = p_br.pivot(index='Филиал', columns='Месяц', values='План_Скорр')
+    pivot_br_25 = p_br.pivot(index='Филиал', columns='Месяц', values='Rev_2025')
+    pivot_br_24 = p_br.pivot(index='Филиал', columns='Месяц', values='Rev_2024')
+    pivot_br_d25_24 = p_br.pivot(index='Филиал', columns='Месяц', values='Δ_25_24')
+    
     for i in range(1, 13):
         if i not in pivot_br.columns: pivot_br[i] = 0
-    pivot_br = pivot_br[range(1, 13)].fillna(0)
+        if i not in pivot_br_plan.columns: pivot_br_plan[i] = 0
+        if i not in pivot_br_25.columns: pivot_br_25[i] = 0
+        if i not in pivot_br_24.columns: pivot_br_24[i] = 0
+        if i not in pivot_br_d25_24.columns: pivot_br_d25_24[i] = 0
     
-    # Динамическая высота: 35px на филиал, минимум 80, максимум 320
-    n_branches = len(pivot_br.index)
-    heatmap_height = min(320, max(80, n_branches * 35))
+    pivot_br = pivot_br[range(1, 13)].fillna(0).sort_index(ascending=False)
+    pivot_br_plan = pivot_br_plan[range(1, 13)].fillna(0).sort_index(ascending=False)
+    pivot_br_25 = pivot_br_25[range(1, 13)].fillna(0).sort_index(ascending=False)
+    pivot_br_24 = pivot_br_24[range(1, 13)].fillna(0).sort_index(ascending=False)
+    pivot_br_d25_24 = pivot_br_d25_24[range(1, 13)].fillna(0).sort_index(ascending=False)
     
+    # Добавляем колонку Итого
+    pivot_br_total = df.groupby('Филиал').agg({'План_Скорр': 'sum', 'Rev_2025': 'sum'})
+    pivot_br_total['Σ'] = np.where(pivot_br_total['Rev_2025'] > 0, 
+        ((pivot_br_total['План_Скорр'] / pivot_br_total['Rev_2025']) - 1) * 100, 0)
+    pivot_br['Σ'] = pivot_br_total['Σ']
+    
+    # Добавляем строку ИТОГО внизу только если больше 1 строки
+    is_single_row_br = len(pivot_br) <= 1
+    
+    if not is_single_row_br:
+        total_row_br_plan = pivot_br_plan.sum()
+        total_row_br_25 = pivot_br_25.sum()
+        total_row_br_24 = pivot_br_24.sum()
+        total_row_br_g = pd.Series({m: ((total_row_br_plan[m] / total_row_br_25[m]) - 1) * 100 if total_row_br_25[m] > 0 else 0 for m in range(1, 13)})
+        total_row_br_d25_24 = pd.Series({m: ((total_row_br_25[m] / total_row_br_24[m]) - 1) * 100 if total_row_br_24[m] > 0 else 0 for m in range(1, 13)})
+        
+        year_br_plan = total_row_br_plan.sum()
+        year_br_25 = total_row_br_25.sum()
+        total_br_sigma = ((year_br_plan / year_br_25) - 1) * 100 if year_br_25 > 0 else 0
+        
+        pivot_br.loc['ИТОГО'] = list(total_row_br_g.values) + [total_br_sigma]
+        pivot_br_plan.loc['ИТОГО'] = total_row_br_plan.values
+        pivot_br_25.loc['ИТОГО'] = total_row_br_25.values
+        pivot_br_24.loc['ИТОГО'] = total_row_br_24.values
+        pivot_br_d25_24.loc['ИТОГО'] = total_row_br_d25_24.values
+    
+    # Создаём кастомный hover текст
+    month_labels_br = [MONTH_MAP_REV[i] for i in range(1, 13)] + ['Σ']
+    hover_texts_br = []
+    for branch in pivot_br.index:
+        row_texts = []
+        for m in range(1, 13):
+            plan_val = pivot_br_plan.loc[branch, m] / 1e6
+            f25_val = pivot_br_25.loc[branch, m] / 1e6
+            f24_val = pivot_br_24.loc[branch, m] / 1e6
+            g_val = pivot_br.loc[branch, m]
+            d25_24 = pivot_br_d25_24.loc[branch, m]
+            
+            g_color = '#27ae60' if g_val >= 0 else '#e74c3c'
+            d_color = '#27ae60' if d25_24 >= 0 else '#e74c3c'
+            g_sign = '+' if g_val >= 0 else ''
+            d_sign = '+' if d25_24 >= 0 else ''
+            
+            text = (
+                f"<b>{branch[:15]}</b><br>"
+                f"<b>{MONTH_MAP_REV[m]}</b><br>"
+                f"<span style='color:#3498db'>План: {plan_val:.1f} млн</span><br>"
+                f"<span style='color:#2ecc71'>2025: {f25_val:.1f} млн</span><br>"
+                f"<span style='color:#95a5a6'>2024: {f24_val:.1f} млн</span><br>"
+                f"<span style='color:{g_color}'>Δ% П/25: {g_sign}{g_val:.0f}%</span><br>"
+                f"<span style='color:{d_color}'>Δ% 25/24: {d_sign}{d25_24:.0f}%</span>"
+            )
+            row_texts.append(text)
+        
+        # Итого колонка - полная информация как для месяцев
+        year_plan = pivot_br_plan.loc[branch].sum() / 1e6
+        year_25 = pivot_br_25.loc[branch].sum() / 1e6
+        year_24 = pivot_br_24.loc[branch].sum() / 1e6
+        year_g = pivot_br.loc[branch, 'Σ']
+        year_d25_24 = ((pivot_br_25.loc[branch].sum() / pivot_br_24.loc[branch].sum()) - 1) * 100 if pivot_br_24.loc[branch].sum() > 0 else 0
+        
+        g_color = '#27ae60' if year_g >= 0 else '#e74c3c'
+        d_color = '#27ae60' if year_d25_24 >= 0 else '#e74c3c'
+        g_sign = '+' if year_g >= 0 else ''
+        d_sign = '+' if year_d25_24 >= 0 else ''
+        
+        row_texts.append(
+            f"<b>{branch[:15]}</b><br>"
+            f"<b>ИТОГО</b><br>"
+            f"<span style='color:#3498db'>План: {year_plan:.1f} млн</span><br>"
+            f"<span style='color:#2ecc71'>2025: {year_25:.1f} млн</span><br>"
+            f"<span style='color:#95a5a6'>2024: {year_24:.1f} млн</span><br>"
+            f"<span style='color:{g_color}'>Δ% П/25: {g_sign}{year_g:.0f}%</span><br>"
+            f"<span style='color:{d_color}'>Δ% 25/24: {d_sign}{year_d25_24:.0f}%</span>"
+        )
+        hover_texts_br.append(row_texts)
+    
+    # Plotly heatmap
     fig_h2 = go.Figure(data=go.Heatmap(
         z=pivot_br.values,
-        x=[MONTH_MAP_REV[i] for i in range(1, 13)],
-        y=[f[:10] for f in pivot_br.index.tolist()],  # Обрезаем длинные названия
-        colorscale='RdYlGn',
+        x=month_labels_br,
+        y=[f[:12] for f in pivot_br.index.tolist()],
+        colorscale=[[0, '#e74c3c'], [0.3, '#f5b7b1'], [0.5, '#ffffff'], [0.7, '#abebc6'], [1, '#27ae60']],
         zmin=-20, zmax=20,
         text=pivot_br.values.round(0).astype(int),
         texttemplate="%{text}",
-        textfont={"size": 11},
-        showscale=False
+        textfont={"size": 9},
+        showscale=False,
+        hovertext=hover_texts_br,
+        hovertemplate='%{hovertext}<extra></extra>'
     ))
-    fig_h2.update_layout(margin=dict(l=0,r=0,t=0,b=0), height=heatmap_height)
-    fig_h2.update_xaxes(tickfont=dict(size=11))
-    fig_h2.update_yaxes(tickfont=dict(size=11))
+    
+    # Динамическая высота для филиалов (не более 320px)
+    calc_height_br = min(320, max(100, len(pivot_br) * 30 + 50))
+    
+    fig_h2.update_layout(margin=dict(l=0,r=0,t=10,b=30), height=calc_height_br, hoverlabel=dict(bgcolor='white', font_size=16))
+    fig_h2.update_xaxes(tickfont=dict(size=14), side='bottom')
+    fig_h2.update_yaxes(tickfont=dict(size=10), autorange='reversed')
     st.plotly_chart(fig_h2, use_container_width=True)
 
 # 4. График сезонности
 with col4:
     st.caption("📊 Сезонность %")
-    m_full['Сез_25'] = m_full['Rev_2025'] / m_full['Rev_2025'].sum() * 100 if m_full['Rev_2025'].sum() > 0 else 0
-    m_full['Сез_План'] = m_full['План_Скорр'] / m_full['План_Скорр'].sum() * 100 if m_full['План_Скорр'].sum() > 0 else 0
+    total_25 = m_full['Rev_2025'].sum()
+    total_plan = m_full['План_Скорр'].sum()
+    total_24 = m_full['Rev_2024'].sum()
+    
+    m_full['Сез_25'] = m_full['Rev_2025'] / total_25 * 100 if total_25 > 0 else 0
+    m_full['Сез_План'] = m_full['План_Скорр'] / total_plan * 100 if total_plan > 0 else 0
+    m_full['Сез_24'] = m_full['Rev_2024'] / total_24 * 100 if total_24 > 0 else 0
+    m_full['Δ_Сез'] = m_full['Сез_План'] - m_full['Сез_25']  # В процентных пунктах
     
     fig4 = go.Figure()
-    fig4.add_trace(go.Scatter(x=m_full['M'], y=m_full['Сез_25'], name='Ф', line=dict(color='#2ecc71', width=1.5), mode='lines'))
-    fig4.add_trace(go.Scatter(x=m_full['M'], y=m_full['Сез_План'], name='П', line=dict(color='#3498db', width=1.5, dash='dash'), mode='lines'))
-    fig4.update_layout(margin=dict(l=0,r=0,t=25,b=30), height=320, showlegend=True, legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0, font=dict(size=11)))
-    fig4.update_xaxes(tickfont=dict(size=12), tickangle=0)
-    fig4.update_yaxes(tickfont=dict(size=12), ticksuffix="%")
+    
+    # 2024 - серая пунктирная
+    fig4.add_trace(go.Scatter(
+        x=m_full['M'], y=m_full['Сез_24'], name='2024', 
+        line=dict(color='#bdc3c7', width=1.5, dash='dot'), mode='lines+markers',
+        marker=dict(size=4, color='#bdc3c7'),
+        hoverinfo='skip'
+    ))
+    
+    # 2025 - зелёная
+    fig4.add_trace(go.Scatter(
+        x=m_full['M'], y=m_full['Сез_25'], name='2025', 
+        line=dict(color='#2ecc71', width=2), mode='lines+markers',
+        marker=dict(size=6, color='#2ecc71'),
+        hoverinfo='skip'
+    ))
+    
+    # План - синяя пунктирная
+    fig4.add_trace(go.Scatter(
+        x=m_full['M'], y=m_full['Сез_План'], name='План', 
+        line=dict(color='#3498db', width=2, dash='dash'), mode='lines+markers',
+        marker=dict(size=6, color='#3498db', symbol='square'),
+        hoverinfo='skip'
+    ))
+    
+    # Единый hover
+    hover_texts_sez = []
+    for _, row in m_full.iterrows():
+        delta = row['Δ_Сез']
+        d_color = '#27ae60' if delta >= 0 else '#e74c3c'
+        d_sign = '+' if delta >= 0 else ''
+        hover_texts_sez.append(
+            f"<b>{row['M']}</b><br>"
+            f"<span style='color:#2ecc71'>2025: {row['Сез_25']:.1f}%</span><br>"
+            f"<span style='color:#3498db'>План: {row['Сез_План']:.1f}%</span><br>"
+            f"<span style='color:#95a5a6'>2024: {row['Сез_24']:.1f}%</span><br>"
+            f"<span style='color:{d_color}'>Δ п.п.: {d_sign}{delta:.1f}</span>"
+        )
+    
+    fig4.add_trace(go.Scatter(
+        x=m_full['M'], y=m_full['Сез_План'],
+        mode='markers', marker=dict(size=15, opacity=0),
+        hovertext=hover_texts_sez, hoverinfo='text', showlegend=False
+    ))
+    
+    fig4.update_layout(
+        margin=dict(l=0,r=0,t=10,b=30), height=320, 
+        showlegend=True, 
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0, font=dict(size=16)),
+        hoverlabel=dict(bgcolor='white', font_size=16),
+        hovermode='x'
+    )
+    fig4.update_xaxes(tickfont=dict(size=14), tickangle=0)
+    fig4.update_yaxes(tickfont=dict(size=14), ticksuffix="%")
     st.plotly_chart(fig4, use_container_width=True)
 
+# --- РЕДАКТОР ЛИМИТОВ РОСТА (Под графиками) ---
+with st.expander("⚙️ Настройка лимитов роста (%)", expanded=False):
+    st.caption("Оставьте ячейку пустой для снятия лимита (по умолчанию рост не ограничен для Мини форматиов, 6% для остальных). Введенное значение (например 5) означает лимит +5% к 2025 году. Изменения сохраняются автоматически.")
+    
+    # Загружаем текущие сохраненные лимиты
+    current_limits = load_limits_local()
+    
+    if 'raw_sales' in st.session_state:
+        df_raw = st.session_state['raw_sales']
+        if not df_raw.empty:
+            all_branches = sorted(df_raw['Филиал'].unique())
+            all_depts = sorted(df_raw['Отдел'].unique())
+            
+            # Строим исходный DF для отображения
+            df_lim_ui = pd.DataFrame(index=all_depts, columns=all_branches)
+            
+            # Заполняем
+            for (br, dp), val in current_limits.items():
+                if br in all_branches and dp in all_depts:
+                    df_lim_ui.at[dp, br] = val
+            
+            # Редактор
+            edited_limits_df = st.data_editor(
+                df_lim_ui,
+                key='limits_editor_matrix_main',
+                use_container_width=True,
+                height=400
+            )
+            
+            # АВТОСОХРАНЕНИЕ ОТКЛЮЧЕНО (вызывало циклическое обновление)
+            # Возвращаем кнопку сохранения
+            if st.button("💾 Сохранить изменения лимитов", type="primary"):
+                new_limits_dict = {}
+                for dp in edited_limits_df.index:
+                    for br in edited_limits_df.columns:
+                        val = edited_limits_df.at[dp, br]
+                        if pd.notna(val) and str(val).strip() != '':
+                            try:
+                                f_val = float(val)
+                                new_limits_dict[(br, dp)] = f_val
+                            except:
+                                pass
+                
+                if save_limits_local(new_limits_dict):
+                    st.toast("Лимиты сохранены! Обновляем...", icon="✅")
+                    st.rerun()
+    else:
+        st.info("Загрузка данных...")
 
 
 # Подготовка таблицы - используем уже рассчитанные колонки из calculate_plan
@@ -1933,10 +2468,19 @@ edit_df = df[['Филиал', 'Отдел', 'Месяц',
               'Сезонность_Факт', 'Сезонность_План',
               'Корр', 'Корр_Дельта', 'Final_Weight', 'Правило', 'Роль']].copy()
 
+# Сортировка по месяцам хронологически
+edit_df = edit_df.sort_values(by=['Филиал', 'Отдел', 'Месяц'])
 
-# Добавляем колонку месяца текстом
-edit_df['Мес'] = edit_df['Месяц'].map(MONTH_MAP_REV)
+
+# Колонка месяца с числовым префиксом для правильной сортировки (1 янв, 2 фев...)
+def fmt_month_display(m):
+    return f"{m} {MONTH_MAP_REV[m]}"
+
+edit_df['Мес'] = edit_df['Месяц'].apply(fmt_month_display)
 edit_df['Корр±'] = edit_df['Корр_Дельта']
+
+# Сортировка по числовому месяцу
+edit_df = edit_df.sort_values(by=['Филиал', 'Отдел', 'Мес'])
 
 # Переименовываем для отображения
 edit_df = edit_df.rename(columns={
@@ -1957,10 +2501,14 @@ edit_df = edit_df.rename(columns={
 edit_df = edit_df.drop(columns=['Корр_Дельта'])
 
 # Порядок колонок как в ноутбуке
-column_order = ['Филиал', 'Отдел', 'Мес', 'Роль', 'Корр±', 'Корр', 'Рекоменд', 'План 2026', 
+all_columns = ['Филиал', 'Отдел', 'Мес', 'Роль', 'Корр±', 'Корр', 'Рекоменд', 'План 2026', 
                 'Выр.2025', 'Выр.2024', 'Выр.25(Н)', 'Δ%_25', 'Δ%_24', 
                 'Сез.Факт', 'Сез.План', 'Вес', 'Цель', 'Расчёт', 'Правило', 'Месяц']
-edit_df = edit_df[[c for c in column_order if c in edit_df.columns]]
+all_columns = [c for c in all_columns if c in edit_df.columns]
+
+# Применяем выбор колонок из sidebar (sel_columns)
+column_order = [c for c in all_columns if c in sel_columns]
+edit_df = edit_df[column_order]
 
 
 
@@ -2009,80 +2557,162 @@ def style_dataframe(df):
     
     return styles
 
+# Функция форматирования чисел с пробелом
+def fmt_num(x):
+    if pd.isna(x):
+        return ''
+    return f'{x:,.0f}'.replace(',', ' ')
+
+def fmt_num_sign(x):
+    if pd.isna(x):
+        return ''
+    return f'{x:+,.0f}'.replace(',', ' ')
+
 # Показываем стилизованную таблицу
 styled = edit_df.style.apply(lambda _: style_dataframe(edit_df), axis=None)
 styled = styled.format({
-    'Выр.2024': '{:,.0f}',
-    'Выр.2025': '{:,.0f}',
-    'Выр.25(Н)': '{:,.0f}',
-    'План 2026': '{:,.0f}',
-    'Рекоменд': '{:,.0f}',
-    'Расчёт': '{:,.0f}',
-    'Цель': '{:,.0f}',
+    'Выр.2024': fmt_num,
+    'Выр.2025': fmt_num,
+    'Выр.25(Н)': fmt_num,
+    'План 2026': fmt_num,
+    'Рекоменд': fmt_num,
+    'Расчёт': fmt_num,
+    'Цель': fmt_num,
     'Δ%_25': '{:.1f}',
     'Δ%_24': '{:.1f}',
     'Сез.Факт': '{:.1f}',
     'Сез.План': '{:.1f}',
     'Вес': '{:.3f}',
-    'Корр': lambda x: f'{x:,.0f}' if pd.notna(x) else '',
-    'Корр±': lambda x: f'{x:+,.0f}' if pd.notna(x) else '',
+    'Корр': fmt_num,
+    'Корр±': fmt_num_sign,
 }, na_rep='')
 
-# Используем st.dataframe для стилизованного отображения
-st.dataframe(styled, use_container_width=True, height=550, hide_index=True)
+# Используем st.data_editor для редактирования Корр и Корр±
+# Для красоты превращаем нередактируемые числа в текст с разделителями и псевдо-выравниванием
+display_df = edit_df.copy()
+static_num_cols = ['Выр.2024', 'Выр.2025', 'Выр.25(Н)', 'План 2026', 'Рекоменд', 'Расчёт', 'Цель']
 
-# Редактор корректировок в expander
-with st.expander("✏️ Редактировать корректировки"):
-    edited = st.data_editor(
-        edit_df[['Филиал', 'Отдел', 'Мес', 'План 2026', 'Корр', 'Корр±']],
-        use_container_width=True,
-        height=300,
-        hide_index=True,
-        disabled=['Филиал', 'Отдел', 'Мес', 'План 2026'],
-        column_config={
-            "План 2026": st.column_config.NumberColumn("План'26", format="%d"),
-            "Корр": st.column_config.NumberColumn(
-                "Корр",
-                help="Абсолютное значение плана. Пустое = нет корр. 0 = обнулить план.",
-                format="%d",
-                default=None
-            ),
-            "Корр±": st.column_config.NumberColumn(
-                "Корр±",
-                help="Добавка/вычет к плану. Пустое = нет корр.",
-                format="%d",
-                default=None
-            ),
-        },
-        key="data_editor",
-        on_change=save_on_change
-    )
+def fmt_right(x):
+    if pd.isna(x): return ""
+    # Обычный пробел или узкий для разделителя
+    s = f"{x:,.0f}".replace(",", " ")
+    # U+2007 (Figure Space) имеет ширину цифры - используем для отступа слева
+    # чтобы визуально выровнять по правому краю в текстовой колонке
+    return s.rjust(12, '\u2007')
 
-# Автосохранение: проверяем изменения и сохраняем
-corrections = []
-for _, row in edited.iterrows():
-    corr_val = row['Корр']
-    delta_val = row['Корр±']
+for col in static_num_cols:
+    if col in display_df.columns:
+        display_df[col] = display_df[col].apply(fmt_right)
+
+# Определяем нередактируемые колонки (все кроме Корр и Корр±)
+disabled_cols = [c for c in edit_df.columns if c not in ['Корр', 'Корр±']]
+
+edited_df = st.data_editor(
+    display_df,
+    use_container_width=True,
+    height=550,
+    hide_index=True,
+    disabled=disabled_cols,
+    column_config={
+        "Корр": st.column_config.NumberColumn(
+            "Корр",
+            help="Абсолютное значение плана. Пустое = нет корр.",
+            format="%.0f",
+            default=None
+        ),
+        "Корр±": st.column_config.NumberColumn(
+            "Корр±",
+            help="Добавка/вычет к плану. Пустое = нет корр.",
+            format="%+d",
+            default=None
+        ),
+        # Статические колонки показываем как текст
+        "Выр.2024": st.column_config.TextColumn("Выр.2024", width="small"),
+        "Выр.2025": st.column_config.TextColumn("Выр.2025", width="small"),
+        "Выр.25(Н)": st.column_config.TextColumn("Выр.25(Н)", width="small"),
+        "План 2026": st.column_config.TextColumn("План 2026", width="small"),
+        "Рекоменд": st.column_config.TextColumn("Рекоменд", width="small"),
+        "Расчёт": st.column_config.TextColumn("Расчёт", width="small"),
+        "Цель": st.column_config.TextColumn("Цель", width="small"),
+        
+        "Δ%_25": st.column_config.NumberColumn("Δ%_25", format="%.1f"),
+        "Δ%_24": st.column_config.NumberColumn("Δ%_24", format="%.1f"),
+        "Сез.Факт": st.column_config.NumberColumn("Сез.Факт", format="%.1f"),
+        "Сез.План": st.column_config.NumberColumn("Сез.План", format="%.1f"),
+    },
+    key="main_data_editor"
+)
+
+# Автосохранение корректировок из редактируемой таблицы
+# Умное сохранение корректировок (Merge изменений)
+saved_corrections = load_corrections_local()
+# Превращаем список в словарь для быстрого поиска по ключу (Филиал, Отдел, Месяц)
+# month преобразуем к int для надежности
+corrections_map = {}
+for item in saved_corrections:
+    key = (item['branch'], item['dept'], int(item['month']))
+    corrections_map[key] = item
+
+changes_detected = False
+
+# Проходим по текущей (возможно отфильтрованной) таблице
+for _, row in edited_df.iterrows():
+    # Определяем месяц (числом)
+    m_val = row.get('Месяц')
+    if pd.isna(m_val) or m_val == '':
+        # Извлекаем число из формата 'N мес' (например '1 янв' -> 1)
+        mes_str = str(row.get('Мес', '1'))
+        m_val = int(mes_str.split()[0]) if mes_str and mes_str[0].isdigit() else 1
     
-    has_corr = pd.notna(corr_val)
-    has_delta = pd.notna(delta_val)
+    try:
+        month = int(m_val)
+    except:
+        continue
+
+    branch = row['Филиал']
+    dept = row['Отдел']
+    key = (branch, dept, month)
+    
+    # Текущие значения в редакторе
+    corr_val = row.get('Корр')
+    delta_val = row.get('Корр±')
+    
+    has_corr = pd.notna(corr_val) if 'Корр' in edited_df.columns else False
+    has_delta = pd.notna(delta_val) if 'Корр±' in edited_df.columns else False
     
     if has_corr or has_delta:
-        corrections.append({
-            'branch': row['Филиал'],
-            'dept': row['Отдел'],
-            'month': row['Месяц'],
-            'corr': int(corr_val) if has_corr else None,
-            'delta': int(delta_val) if has_delta else None
-        })
+        new_corr = int(corr_val) if has_corr else None
+        new_delta = int(delta_val) if has_delta else None
+        
+        # Проверяем, изменилось ли что-то (сравниваем только значимые поля)
+        old_item = corrections_map.get(key)
+        old_corr = old_item.get('corr') if old_item else None
+        old_delta = old_item.get('delta') if old_item else None
+        
+        if old_corr != new_corr or old_delta != new_delta:
+            new_item = {
+                'branch': branch,
+                'dept': dept,
+                'month': month,
+                'corr': new_corr,
+                'delta': new_delta
+            }
+            corrections_map[key] = new_item
+            changes_detected = True
+    else:
+        # Если корректировки нет (пусто), но она БЫЛА в файле -> удаляем (пользователь стер)
+        if key in corrections_map:
+            del corrections_map[key]
+            changes_detected = True
 
-# Сравниваем с сохранёнными и обновляем если нужно
-saved_corrections = load_corrections_local()
-if corrections != saved_corrections:
-    save_corrections_local(corrections)
+if changes_detected:
+    new_corrections_list = list(corrections_map.values())
+    save_corrections_local(new_corrections_list)
     st.cache_data.clear()
+    st.rerun()
 
 # Статистика корректировок (компактно)
-corr_count = edited['Корр'].notna().sum() + edited['Корр±'].notna().sum()
+corr_count = (edited_df['Корр'].notna().sum() if 'Корр' in edited_df.columns else 0) + \
+             (edited_df['Корр±'].notna().sum() if 'Корр±' in edited_df.columns else 0)
 if corr_count > 0:
     st.caption(f"✏️ Корректировок: {corr_count}")
