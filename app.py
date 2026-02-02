@@ -78,6 +78,26 @@ WEIGHT_2025 = 0.5
 def save_corrections_local(corrections_list):
     try:
         filepath = os.path.join(DATA_DIR, 'corrections.json')
+        backup_dir = os.path.join(DATA_DIR, 'backups')
+        
+        # Создаём папку для бэкапов
+        os.makedirs(backup_dir, exist_ok=True)
+        
+        # Создаём backup с датой и временем
+        if os.path.exists(filepath):
+            from datetime import datetime
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            backup_path = os.path.join(backup_dir, f'corrections_{timestamp}.json')
+            import shutil
+            shutil.copy2(filepath, backup_path)
+            
+            # Храним только последние 50 бэкапов
+            backups = sorted([f for f in os.listdir(backup_dir) if f.startswith('corrections_')])
+            if len(backups) > 50:
+                for old_backup in backups[:-50]:
+                    os.remove(os.path.join(backup_dir, old_backup))
+        
+        # Сохраняем новую версию
         with open(filepath, 'w', encoding='utf-8') as f:
             json.dump(corrections_list, f, ensure_ascii=False, indent=2)
         return True
@@ -204,7 +224,15 @@ def parse_month(val):
     return MONTH_MAP.get(val_str[:3], 0)
 
 def has_correction(df, mask=None):
-    """Проверяет наличие корректировки"""
+    """Проверяет наличие АБСОЛЮТНОЙ корректировки (Корр). 
+    Корр_Дельта НЕ защищает отдел от перебалансировки до финального применения."""
+    check = df['Корр'].notna()
+    if 'Авто_Корр' in df.columns:
+        check = check | df['Авто_Корр'].notna()
+    return check & mask if mask is not None else check
+
+def has_any_correction(df, mask=None):
+    """Проверяет наличие любой корректировки (включая Корр_Дельта) — для финальной защиты."""
     check = df['Корр'].notna() | df['Корр_Дельта'].notna()
     if 'Авто_Корр' in df.columns:
         check = check | df['Авто_Корр'].notna()
@@ -529,7 +557,8 @@ def apply_min_plan_network(df):
         
         # Отделы ниже минимума
         below_min_mask = (plan_skorr < min_plan) & (rev_2025 > 0) & (min_plan > 0)
-        has_corr = df.loc[indices, 'Корр'].notna() | df.loc[indices, 'Корр_Дельта'].notna()
+        # Защищаем только отделы с Корр (абсолютной), НЕ Корр_Дельта
+        has_corr = df.loc[indices, 'Корр'].notna()
         below_min_mask = below_min_mask & ~has_corr
         
         below_indices = [idx for idx, is_below in zip(indices, below_min_mask) if is_below]
@@ -548,8 +577,9 @@ def apply_min_plan_network(df):
         
         # Снимаем с других отделов пропорционально
         other_indices = [idx for idx in indices if idx not in below_indices]
+        # Защищаем только отделы с Корр (абсолютной), НЕ Корр_Дельта
         other_indices = [idx for idx in other_indices
-                       if not (pd.notna(df.loc[idx, 'Корр']) or pd.notna(df.loc[idx, 'Корр_Дельта']))]
+                       if not pd.notna(df.loc[idx, 'Корр'])]
         
         # Исключаем отделы с лимитами
         if limits_dict:
@@ -600,8 +630,9 @@ def apply_load_coefficients(df, role_coefficients):
     
     result = df.copy()
     
-    # Получаем отделы с ручными корректировками (их не трогаем)
-    has_corr = result['Корр'].notna() | result['Корр_Дельта'].notna()
+    # Получаем отделы с АБСОЛЮТНЫМИ корректировками (их не трогаем)
+    # Корр_Дельта НЕ защищает - она применяется в самом конце
+    has_corr = result['Корр'].notna()
     if 'Авто_Корр' in result.columns:
         has_corr = has_corr | result['Авто_Корр'].notna()
     
@@ -1538,19 +1569,18 @@ def calculate_plan(df_sales, corrections=None, role_coefficients=None, limits=No
                     base = g.loc[idx, '_theoretical']
                     is_precalc = False
 
-                # Применяем Ручные корректировки (Они имеют приоритет над base)
+                # Применяем ТОЛЬКО абсолютную корректировку (Корр)
+                # Корр_Дельта применяется В САМОМ КОНЦЕ (после всех балансировок)
                 if pd.notna(corr):
                     # Explicit 0 from user forces 0
                     if corr == 0:
                         final = 0
                     else:
-                        # Add delta if exists
-                        final = corr + (delta if pd.notna(delta) else 0)
-                elif pd.notna(delta):
-                    # Delta only - add to base (Precalc or Theoretical)
-                    final = base + delta
+                        # Абсолютная корректировка - используем как есть
+                        final = corr
                 else:
-                    # No manual correction - use base
+                    # Нет абсолютной корректировки - используем base
+                    # Корр_Дельта будет применена позже в ШАГ 14
                     final = base
                 
                 # Apply Rounding and Threshold rules (Standardized)
@@ -1898,250 +1928,317 @@ def calculate_plan(df_sales, corrections=None, role_coefficients=None, limits=No
     with open('/tmp/debug_oboi_before_step13.txt', 'w') as f:
         f.write(f"Oboi before Step 13: {oboi_before_step13:,.0f}\n")
 
-    # ========== ШАГ 13: ФИНАЛЬНАЯ БАЛАНСИРОВКА ==========
-    # Проверяем сходимость по каждому филиалу/месяцу и перераспределяем остаток
+    # ========== ШАГ 13: SMART BALANCING v2 (Для обычных форматов) ==========
+    # Логика:
+    # 1. Считаем "Пол" (Факт + 6%).
+    # 2. Считаем Score для каждого отдела (на основе Доли рынка и Тренда).
+    # 3. Если денег много (Delta > 0) -> Раздаем тем, у кого высокий Score (недобор доли + рост).
+    # 4. Если денег мало (Delta < 0) -> Режем тех, у кого низкий Score (перегретая доля + падение).
     
+    # === НАСТРОЙКИ ВЕСОВ ===
+    SMART_WEIGHTS = {
+        'penetration': 0.6,  # 60% - "Сколько еще места на рынке?"
+        'momentum': 0.4      # 40% - "Как быстро бежим?"
+    }
+    INFLATION_FLOOR = 0.06
+    ROUND_STEP = ROUNDING_STEP  # 10000
+    
+    # S-кривая для нормализации
+    def sigmoid(x, k=1, x0=0):
+        return 1 / (1 + np.exp(-k * (x - x0)))
+    
+    def calculate_score_smart(group_data, network_share_map):
+        """Рассчитывает Score без использования площади."""
+        # 1. МОМЕНТУМ (ТЯГА)
+        prev_rev = group_data['Rev_2024'].replace(0, 1) if 'Rev_2024' in group_data.columns else pd.Series(1, index=group_data.index)
+        rev_col = 'Rev_2025_Norm' if 'Rev_2025_Norm' in group_data.columns else 'Rev_2025'
+        momentum_raw = np.log1p(group_data[rev_col] / prev_rev)
+        score_momentum = sigmoid(momentum_raw, k=2, x0=0.7)
+        
+        # 2. ПРОНИКНОВЕНИЕ (ПОТЕНЦИАЛ)
+        total_rev = group_data[rev_col].sum()
+        if total_rev == 0: total_rev = 1
+        local_shares = group_data[rev_col] / total_rev
+        
+        # Целевая доля по формату сети
+        fmt = group_data['Формат'].iloc[0] if 'Формат' in group_data.columns else 'Средний'
+        target_shares = group_data['Отдел'].apply(lambda x: network_share_map.get((fmt, x), 0.05))
+        
+        # Gap = Цель / Факт
+        penetration_gap = (target_shares / local_shares).replace([np.inf, -np.inf], 1.0).fillna(1.0)
+        score_penetration = sigmoid(penetration_gap, k=2, x0=1.0)
+        
+        # ИТОГОВЫЙ СКОР
+        final_score = (
+            score_momentum * SMART_WEIGHTS['momentum'] +
+            score_penetration * SMART_WEIGHTS['penetration']
+        )
+        
+        # БОНУСЫ ЗА РОЛЬ
+        role_multiplier = group_data['Роль'].map({
+            'Стратегический': 1.1,  # +10% приоритета
+            'Сопутствующий': 0.9    # -10% приоритета
+        }).fillna(1.0) if 'Роль' in group_data.columns else pd.Series(1.0, index=group_data.index)
+        
+        return final_score * role_multiplier
+    
+    # --- ПРЕДРАСЧЕТ ДОЛЕЙ СЕТИ ---
+    rev_col = 'Rev_2025_Norm' if 'Rev_2025_Norm' in result.columns else 'Rev_2025'
+    if rev_col in result.columns and 'Формат' in result.columns:
+        net_stats = result.groupby(['Формат', 'Отдел'])[rev_col].sum().reset_index()
+        fmt_totals = result.groupby(['Формат'])[rev_col].sum().reset_index().rename(columns={rev_col: 'Total'})
+        net_stats = pd.merge(net_stats, fmt_totals, on='Формат')
+        net_stats['Share'] = net_stats[rev_col] / net_stats['Total']
+        NETWORK_SHARE_MAP = net_stats.set_index(['Формат', 'Отдел'])['Share'].to_dict()
+    else:
+        NETWORK_SHARE_MAP = {}
+    
+    # --- ПРЕДРАСЧЕТ СЕЗОННОСТИ ПО ОТДЕЛАМ СЕТИ ---
+    # Для сезонных отделов (Краски, Стройматериалы, 2В, 10А)
+    # Сезонность = доля месяца в годовой выручке отдела по всей сети
+    SEASONAL_DEPTS = ['Краски', 'Стройматериалы', '2В', '2в', '10А', '10а']
+    DEPT_SEASONALITY_MAP = {}  # {(Отдел, Месяц): сезонность}
+    DEPT_YEAR_TOTAL = {}  # {Отдел: годовая сумма}
+    
+    for dept in result['Отдел'].unique():
+        if any(s in str(dept) for s in SEASONAL_DEPTS):
+            dept_data = result[result['Отдел'] == dept]
+            year_total = dept_data[rev_col].sum()
+            DEPT_YEAR_TOTAL[dept] = year_total
+            
+            for m in range(1, 13):
+                month_total = dept_data[dept_data['Месяц'] == m][rev_col].sum()
+                seasonality = month_total / year_total if year_total > 0 else 1/12
+                DEPT_SEASONALITY_MAP[(dept, m)] = seasonality
+    
+    # --- ГЛАВНЫЙ ЦИКЛ ПО ФИЛИАЛАМ ---
     for (branch, month), group in result.groupby(['Филиал', 'Месяц']):
         idx = group.index
         
-        # ВАЖНО: Финальная балансировка для ВСЕХ форматов
-        # Промежуточные правила (smooth growth, компрессор) могут нарушить сходимость
-        
+        # 1. ЦЕЛЬ ФИЛИАЛА
         target = result.loc[idx, 'План'].iloc[0]
-        if pd.isna(target):
+        if pd.isna(target) or target <= 0: 
             continue
         target = int(round(target))
         
-        current_sum = result.loc[idx, 'План_Расч'].sum()
-        diff = target - current_sum
-        
-        if diff == 0:
-            continue
-        
-        # DEBUG: Log all branches with non-zero diff for step 13
-        if 'Вологда' in branch and month == 1:
-            import json
-            debug_step13_diff = {
-                'branch': branch, 'month': int(month),
-                'target': float(target), 'current_sum': float(current_sum), 'diff': float(diff)
-            }
-            with open('/tmp/debug_step13_diff.json', 'w', encoding='utf-8') as f:
-                json.dump(debug_step13_diff, f, ensure_ascii=False, indent=2)
-        
-        # Находим активные отделы
-        # ИСКЛЮЧАЯ те, которые имеют ручные корректировки (мы должны сохранить их значения)
+        # Определяем формат
         group_slice = result.loc[idx]
-        fixed_mask = has_correction(group_slice)
+        branch_format = group_slice['Формат'].iloc[0] if 'Формат' in group_slice.columns else 'Средний'
+        is_special_branch = branch_format in SPECIAL_FORMATS
         
-        # Стратегические с strategic_growth_rate тоже фиксированы
-        strategic_growth_rates = load_strategic_growth_rates()
-        if strategic_growth_rates:
-            for i, row in group_slice.iterrows():
-                if strategic_growth_rates.get((row['Филиал'], row['Отдел'])) is not None:
-                    fixed_mask.loc[i] = True
-        
-        # Определяем, нужно ли исключить стратегических из балансировки
-        # Для НЕ спец-форматов с падением: стратегические фиксированы
-        is_special_branch = group_slice['Формат'].iloc[0] in SPECIAL_FORMATS if 'Формат' in group_slice.columns else False
-        
-        # Рассчитываем прирост/падение филиала
-        rev_2025_sum = group_slice['Rev_2025'].sum() if 'Rev_2025' in group_slice.columns else 0
-        branch_growth = (target / rev_2025_sum - 1) if rev_2025_sum > 0 else 0
-        
-        # Для остальных форматов с падением: стратегические НЕ участвуют в балансировке
-        exclude_strategic = (not is_special_branch) and (branch_growth < 0)
-        
-        # DEBUG: Log for Vologda
-        if 'Вологда' in branch and month == 1:
-            import json
-            debug_step13 = {
-                'branch': str(branch), 'month': int(month),
-                'target': float(target), 'current_sum': float(current_sum), 'diff': float(diff),
-                'is_special_branch': bool(is_special_branch),
-                'branch_growth': float(branch_growth),
-                'exclude_strategic': bool(exclude_strategic),
-                'format': str(group_slice['Формат'].iloc[0]) if 'Формат' in group_slice.columns else 'N/A'
-            }
-            with open('/tmp/debug_step13.json', 'w', encoding='utf-8') as f:
-                json.dump(debug_step13, f, ensure_ascii=False, indent=2)
-        
-        # Для остальных форматов с падением: ВСЕ фиксированы, пропускаем балансировку
-        if exclude_strategic:
-            # Все уже фиксированы из precalc, не балансируем
-            continue
-        else:
+        # ДЛЯ СПЕЦ-ФОРМАТОВ (Мини/Микро/Интернет) — используем СТАРУЮ логику
+        if is_special_branch:
+            # Старая логика: водопадное распределение с лимитами
+            fixed_mask = has_correction(group_slice)
+            strategic_growth_rates = load_strategic_growth_rates()
+            if strategic_growth_rates:
+                for i, row in group_slice.iterrows():
+                    if strategic_growth_rates.get((row['Филиал'], row['Отдел'])) is not None:
+                        fixed_mask.loc[i] = True
+            
             active_mask = (group_slice['План_Расч'] > 0) & (~fixed_mask)
-        
-        active_idx = idx[active_mask]
-        
-        if len(active_idx) == 0:
-            # Если нет активных сопутствующих, балансируем только не-фиксированных
-            # НЕ включаем отделы с strategic_rate!
-            continue  # Пропускаем — все уже фиксированы
-        
-        # === ИТЕРАТИВНОЕ РАСПРЕДЕЛЕНИЕ С УЧЕТОМ ЛИМИТОВ (WATER FILLING) ===
-        
-        # Получаем данные 2025 года для расчета лимитов
-        rev_col = 'Rev_2025' if 'Rev_2025' in result.columns else 'Выручка_2025'
-        
-        active_candidates = result.loc[active_idx].copy()
-        
-        # Функция определения лимита для конкретной строки
-        def get_max_plan(row):
-            # Если лимиты не переданы - нет ограничений
-            if not limits:
-                return float('inf')
+            active_idx = idx[active_mask]
             
-            branch_name = row['Филиал']
-            dept_name = row['Отдел']
+            if len(active_idx) == 0:
+                continue
             
-            # Ключ может быть кортежем (Branch, Dept) или строкой
-            # Пробуем форматы хранения
-            limit_val = limits.get((branch_name, dept_name))
+            current_sum = result.loc[idx, 'План_Расч'].sum()
+            diff = target - current_sum
             
-            # Если в таблице пусто (None) -> нет лимита
-            if limit_val is None or limit_val == '':
-                return float('inf')
-                
-            try:
-                pct = float(limit_val)
-            except (ValueError, TypeError):
-                return float('inf')
+            if diff == 0:
+                continue
             
-            base_rev = row.get(rev_col, 0)
-            if base_rev <= 0:
-                return float('inf') 
-            
-            return base_rev * (1 + pct / 100.0)
-
-        current_limits_series = active_candidates.apply(get_max_plan, axis=1)
-        
-        # Начальное состояние
-        participants = list(active_idx)
-        remaining_diff = diff
-        
-        while abs(remaining_diff) > 1 and participants:
-            # Текущие веса участников
-            current_parts = result.loc[participants]
-            weights = current_parts.get('Final_Weight', pd.Series(1, index=participants))
-            
+            # Водопадное распределение
+            weights = result.loc[active_idx, 'Final_Weight'] if 'Final_Weight' in result.columns else result.loc[active_idx, 'План_Расч']
             w_sum = weights.sum()
-            if w_sum == 0:
-                weights = current_parts['План_Расч']
-                w_sum = weights.sum()
+            if w_sum > 0:
+                shares = weights / w_sum
+                result.loc[active_idx, 'План_Расч'] += diff * shares
             
-            shares = (weights / w_sum) if w_sum > 0 else pd.Series(1.0 / len(participants), index=participants)
+            # Округление
+            result.loc[active_idx, 'План_Расч'] = (result.loc[active_idx, 'План_Расч'] / ROUND_STEP).round(0) * ROUND_STEP
+            result.loc[active_idx, 'План_Расч'] = result.loc[active_idx, 'План_Расч'].clip(lower=0)
+            result.loc[active_idx, 'План_Расч'] = np.where(
+                result.loc[active_idx, 'План_Расч'] < MIN_PLAN_THRESHOLD, 
+                0, 
+                result.loc[active_idx, 'План_Расч']
+            )
             
-            # Попытка распределить
-            to_distribute = shares * remaining_diff
-            
-            overflow_indices = []
-            
-            if remaining_diff > 0:
-                predicted_plan = result.loc[participants, 'План_Расч'] + to_distribute
-                
-                # Сравниваем с лимитом
-                subset_limits = current_limits_series.loc[participants]
-                overshoot = predicted_plan > subset_limits
-                
-                if overshoot.any():
-                    overflow_indices = overshoot[overshoot].index.tolist()
-                    for o_idx in overflow_indices:
-                        limit_val = subset_limits.loc[o_idx]
-                        current_val = result.loc[o_idx, 'План_Расч']
-                        added = max(0, limit_val - current_val)
-                        result.loc[o_idx, 'План_Расч'] = limit_val
-                        remaining_diff -= added
-            
-            if not overflow_indices:
-                result.loc[participants, 'План_Расч'] += to_distribute
-                remaining_diff = 0
-                break
-            else:
-                for o_idx in overflow_indices:
-                    participants.remove(o_idx)
-        
-        # Если цикл завершился (все переполнились), а remain_diff остался
-        if abs(remaining_diff) > 1 and not participants:
-             # Все переполнились. Принудительно размазываем остаток
-             all_active = active_idx
-             weights = result.loc[all_active, 'Final_Weight']
-             w_sum = weights.sum()
-             dist_weights = (weights / w_sum) if w_sum > 0 else pd.Series(1, index=all_active)
-             result.loc[all_active, 'План_Расч'] += remaining_diff * dist_weights
-
-        # Округление до ROUNDING_STEP для ВСЕХ форматов
-        # (ранее спец-форматы пропускались, что ломало округление)
-        if len(active_idx) > 0:
-            # 1. Округляем до ближайших 10000
-            current_vals = result.loc[active_idx, 'План_Расч']
-            # Стандартное математическое округление до 10000
-            rounded_vals = (current_vals / ROUNDING_STEP).round(0) * ROUNDING_STEP
-            
-            # 2. Обнуляем те, что меньше порога
-            rounded_vals = np.where(rounded_vals < MIN_PLAN_THRESHOLD, 0, rounded_vals)
-            result.loc[active_idx, 'План_Расч'] = rounded_vals
-        
-        # 3. Балансируем разницу (остаток должен быть кратен шагу, так как target тоже кратен или округляем и его)
-        # target уже округлен до целого, но не обязательно до 10к.
-        # В оригинале target - это план филиала, он обычно круглый, но проверим.
-        
-        current_sum = result.loc[idx, 'План_Расч'].sum()
-        new_diff = target - current_sum
-        
-        # Разницу тоже нужно привести к шагу, чтобы не ломать кратность
-        # Если target не кратен 10к, то мы не сможем сделать сумму кратной.
-        # Но будем считать, что нам важно, чтобы слагаемые были кратны.
-        # Остаток просто кидаем на макс вес.
-        
-        if new_diff != 0:
-            # Округляем разницу до шага (чтобы сохранить кратность планов)
-            # Внимание: тогда сумма может не сойтись с target, если target не кратен 10к.
-            # Но требование "все планы кратны 10к" приоритетнее точного соответствия некруглому target.
-            
-            diff_rounded = round(new_diff / ROUNDING_STEP) * ROUNDING_STEP
-            
-            if diff_rounded != 0:
-                candidates_w = result.loc[active_idx, 'Final_Weight']
-                if candidates_w.sum() == 0:
-                     candidates_w = result.loc[active_idx, 'План_Расч']
-                
-                # Если все активные обнулились из-за порога — НЕ добавляем к ним diff!
-                # Это создаст маленькие планы < 30000
-                # Вместо этого, ищем отдел с планом >= 30000
-                active_with_plan = active_idx[result.loc[active_idx, 'План_Расч'] >= MIN_PLAN_THRESHOLD]
-                
-                if len(active_with_plan) > 0:
-                    max_w_idx = result.loc[active_with_plan, 'План_Расч'].idxmax()
-                elif len(active_idx) > 0 and diff_rounded >= MIN_PLAN_THRESHOLD:
-                    # Если diff сам по себе >= 30000, можем создать новый план
-                    max_w_idx = active_idx[0]
-                else:
-                    max_w_idx = None
-
-                if max_w_idx:
-                    val = result.loc[max_w_idx, 'План_Расч'] + diff_rounded
-                    
-                    # Проверяем минимум: если результат < 30000, но > 0 — ставим 30000
-                    if val >= MIN_PLAN_THRESHOLD:
-                        result.loc[max_w_idx, 'План_Расч'] = val
-                    elif val == 0:
-                        result.loc[max_w_idx, 'План_Расч'] = 0
-                    elif val > 0:
-                        # val < 30000 — ставим минимум
-                        result.loc[max_w_idx, 'План_Расч'] = MIN_PLAN_THRESHOLD
-            
-            # Маленький остаток (< 10000) — добавляем к крупнейшему отделу
-            # Только для него нарушаем округление, остальные остаются кратными 10000
+            # Финальная сходимость
             final_sum = result.loc[idx, 'План_Расч'].sum()
             final_residual = target - final_sum
+            if final_residual != 0:
+                all_plans = result.loc[idx, 'План_Расч']
+                if all_plans.max() > 0:
+                    max_idx = all_plans.idxmax()
+                    result.loc[max_idx, 'План_Расч'] += final_residual
+            continue
+        
+        # ========== SMART BALANCING v2 ДЛЯ ОБЫЧНЫХ ФОРМАТОВ ==========
+        
+        # 2. ФИКСИРОВАННЫЕ (Неприкасаемые)
+        is_manual = has_correction(group_slice)
+        
+        # Спец. ставки из json
+        has_rate = pd.Series(False, index=idx)
+        strategic_growth_rates = load_strategic_growth_rates()
+        acc_growth_rates = load_growth_rates_local()
+        
+        for i in idx:
+            d = result.loc[i, 'Отдел']
+            b = result.loc[i, 'Филиал']
+            if strategic_growth_rates.get((b, d)) is not None: 
+                has_rate.loc[i] = True
+            if acc_growth_rates.get((b, d), 0) != 0: 
+                has_rate.loc[i] = True
+        
+        # Двери и Кухни
+        is_special_dept = group_slice['Отдел'].str.contains('Двери|Мебель для к', case=False, na=False)
+        
+        fixed_mask = is_manual | has_rate | is_special_dept
+        fixed_sum = result.loc[idx[fixed_mask], 'План_Расч'].sum()
+        
+        # 3. АКТИВНЫЕ
+        rev_col_active = 'Rev_2025_Norm' if 'Rev_2025_Norm' in result.columns else 'Rev_2025'
+        active_mask = (~fixed_mask) & (result.loc[idx, rev_col_active] > 0)
+        active_idx = idx[active_mask]
+        
+        residual_target = target - fixed_sum
+        
+        if len(active_idx) == 0 or residual_target <= 0:
+            if len(active_idx) > 0: 
+                result.loc[active_idx, 'План_Расч'] = 0
+            continue
+        
+        # 4. ПОЛ (BASE FLOOR)
+        rev_25 = result.loc[active_idx, rev_col_active]
+        rev_24 = result.loc[active_idx, 'Rev_2024'].replace(0, 1) if 'Rev_2024' in result.columns else pd.Series(1, index=active_idx)
+        mom = rev_25 / rev_24
+        
+        floor_multipliers = pd.Series(1 + INFLATION_FLOOR, index=active_idx)
+        
+        # Ослабление пола для падающих сопутствующих
+        if 'Роль' in result.columns:
+            weak_acc = (result.loc[active_idx, 'Роль'] == 'Сопутствующий') & (mom < 0.95)
+            floor_multipliers.loc[weak_acc] = 0.95
+        
+        # БОНУС ДЛЯ СОПУТСТВУЮЩИХ: на каждые 3% прироста стратегических — +1%
+        if 'Роль' in result.columns:
+            # Считаем средний прирост стратегических в этом филиале/месяце
+            strat_mask = result.loc[idx, 'Роль'] == 'Стратегический'
+            if strat_mask.any():
+                strat_rev_25 = result.loc[idx[strat_mask], rev_col_active].sum()
+                strat_rev_24 = result.loc[idx[strat_mask], 'Rev_2024'].sum() if 'Rev_2024' in result.columns else strat_rev_25
+                if strat_rev_24 > 0:
+                    strat_growth = (strat_rev_25 / strat_rev_24) - 1  # Например 0.09 = +9%
+                    if strat_growth > 0:
+                        # Бонус = strat_growth / 3 (на каждые 3% прироста -> +1%)
+                        acc_bonus = strat_growth / 3
+                        # Применяем к сопутствующим
+                        acc_mask_active = result.loc[active_idx, 'Роль'] == 'Сопутствующий'
+                        floor_multipliers.loc[acc_mask_active] += acc_bonus
+        
+        base_floor = rev_25 * floor_multipliers
+        total_floor = base_floor.sum()
+        
+        # 5. ДЕЛЬТА И СКОРИНГ
+        delta = residual_target - total_floor
+        scores = calculate_score_smart(result.loc[active_idx], NETWORK_SHARE_MAP)
+        
+        # 6. РАСПРЕДЕЛЕНИЕ
+        if delta > 0:
+            # === ИЗБЫТОК (GROWTH) ===
+            dist_weights = result.loc[active_idx, rev_col_active] * (scores ** 2)
             
-            if final_residual != 0 and abs(final_residual) < ROUNDING_STEP:
-                # Находим отдел с максимальным планом
-                plans = result.loc[idx, 'План_Расч']
-                if plans.max() > 0:
-                    max_plan_idx = plans.idxmax()
-                    result.loc[max_plan_idx, 'План_Расч'] += final_residual
+            if dist_weights.sum() > 0:
+                share = dist_weights / dist_weights.sum()
+                final_plans = base_floor + (delta * share)
+            else:
+                final_plans = base_floor
+        else:
+            # === ДЕФИЦИТ (CUT) ===
+            max_score = scores.max() + 0.1
+            weakness = max_score - scores
+            
+            cut_weights = result.loc[active_idx, rev_col_active] * (weakness ** 2)
+            
+            if cut_weights.sum() > 0:
+                share = cut_weights / cut_weights.sum()
+                final_plans = base_floor + (delta * share)
+            else:
+                ratio = residual_target / total_floor if total_floor > 0 else 0
+                final_plans = base_floor * ratio
+            
+            # Hard stop: не ниже 80% от факта 2025
+            final_plans = final_plans.clip(lower=result.loc[active_idx, rev_col_active] * 0.8)
+        
+        # ОГРАНИЧЕНИЕ: Обои — не более +8% прироста и не ниже 0%
+        MAX_GROWTH_LIMITED = 0.08
+        MIN_GROWTH_LIMITED = 0.0  # Не ниже факта 2025
+        for i in active_idx:
+            dept_name = result.loc[i, 'Отдел']
+            if 'Обои' in str(dept_name):
+                fact_val = result.loc[i, rev_col_active]
+                max_plan = fact_val * (1 + MAX_GROWTH_LIMITED)
+                min_plan = fact_val * (1 + MIN_GROWTH_LIMITED)  # = факт
+                final_plans.loc[i] = max(min(final_plans.loc[i], max_plan), min_plan)
+        
+        # ОГРАНИЧЕНИЕ: 9А — только максимум +8% (без минимального пола)
+        for i in active_idx:
+            dept_name = result.loc[i, 'Отдел']
+            if '9А' in str(dept_name) or '9а' in str(dept_name):
+                fact_val = result.loc[i, rev_col_active]
+                max_plan = fact_val * (1 + MAX_GROWTH_LIMITED)
+                final_plans.loc[i] = min(final_plans.loc[i], max_plan)
+        
+        # СЕЗОННЫЕ ОТДЕЛЫ: Краски, Стройматериалы, 2В, 10А — план по сезонности сети
+        for i in active_idx:
+            dept_name = result.loc[i, 'Отдел']
+            if any(s in str(dept_name) for s in SEASONAL_DEPTS):
+                # Годовой факт филиала для этого отдела
+                branch_dept_mask = (result['Филиал'] == branch) & (result['Отдел'] == dept_name)
+                branch_year_fact = result.loc[branch_dept_mask, rev_col_active].sum()
+                
+                # Сезонность по сети для этого отдела и месяца
+                seasonality = DEPT_SEASONALITY_MAP.get((dept_name, month), 1/12)
+                
+                # План = Годовой_Факт_Филиала × Сезонность_Сети
+                seasonal_plan = branch_year_fact * seasonality
+                
+                # ОГРАНИЧЕНИЕ: 2. Стройматериалы, 2Б, 2В — максимум +6% прироста (2А исключён)
+                if '2. Стройматериалы' in str(dept_name) or 'Стройматериалы' in str(dept_name) or '2Б' in str(dept_name) or '2В' in str(dept_name) or '2б' in str(dept_name) or '2в' in str(dept_name):
+                    fact_month = result.loc[i, rev_col_active]
+                    max_plan = fact_month * 1.06
+                    seasonal_plan = min(seasonal_plan, max_plan)
+                
+                final_plans.loc[i] = seasonal_plan
+        
+        # 7. ОКРУГЛЕНИЕ
+        result.loc[active_idx, 'План_Расч'] = final_plans
+        result.loc[active_idx, 'План_Расч'] = (result.loc[active_idx, 'План_Расч'] / ROUND_STEP).round(0) * ROUND_STEP
+        
+        # Минимальный порог
+        result.loc[active_idx, 'План_Расч'] = np.where(
+            result.loc[active_idx, 'План_Расч'] < MIN_PLAN_THRESHOLD,
+            0,
+            result.loc[active_idx, 'План_Расч']
+        )
+        
+        # 8. 100% СХОДИМОСТЬ
+        current_total = result.loc[idx, 'План_Расч'].sum()
+        diff_final = target - current_total
+        
+        if diff_final != 0:
+            # Большой остаток — на крупнейший активный
+            if abs(diff_final) >= ROUND_STEP and len(active_idx) > 0:
+                best_candidate = result.loc[active_idx, 'План_Расч'].idxmax()
+                result.loc[best_candidate, 'План_Расч'] += diff_final
+            # Маленький остаток — на любой крупнейший
+            elif abs(diff_final) < ROUND_STEP:
+                all_plans = result.loc[idx, 'План_Расч']
+                if all_plans.max() > 0:
+                    max_idx = all_plans.idxmax()
+                    result.loc[max_idx, 'План_Расч'] += diff_final
 
     # ========== ШАГ 13.5: ПРАВИЛО +6% ДЛЯ СОПУТСТВУЮЩИХ (после балансировки) ==========
     # Для спец-форматов: Сопутствующие должны иметь минимум +6% к Факту_2025
@@ -2306,14 +2403,15 @@ def calculate_plan(df_sales, corrections=None, role_coefficients=None, limits=No
         if corr_mask.any():
             result.loc[corr_mask, 'План_Скорр'] = result.loc[corr_mask, 'Корр']
     
-    # Корр_Дельта — дельта к расчётному плану (применяется если нет абсолютной корректировки)
+    # Корр_Дельта — дельта к скорректированному плану (применяется если нет абсолютной корректировки)
     if 'Корр_Дельта' in result.columns:
         delta_mask = result['Корр_Дельта'].notna() & (result['Корр_Дельта'] != 0)
         # Применяем дельту только если нет абсолютной корректировки
         if 'Корр' in result.columns:
             delta_mask = delta_mask & result['Корр'].isna()
         if delta_mask.any():
-            result.loc[delta_mask, 'План_Скорр'] = result.loc[delta_mask, 'План_Расч'] + result.loc[delta_mask, 'Корр_Дельта']
+            # Применяем к План_Скорр (после балансировки), не к План_Расч!
+            result.loc[delta_mask, 'План_Скорр'] = result.loc[delta_mask, 'План_Скорр'] + result.loc[delta_mask, 'Корр_Дельта']
     
     # Убедимся что План_Скорр >= 0
     result['План_Скорр'] = result['План_Скорр'].clip(lower=0)
@@ -2346,6 +2444,12 @@ def calculate_plan(df_sales, corrections=None, role_coefficients=None, limits=No
         adjustable_idx = grp_idx[adjustable_mask]
         
         if len(adjustable_idx) == 0:
+            # Нет некорректированных отделов, но маленький остаток всё равно нужно обработать
+            if abs(diff) < ROUNDING_STEP and diff != 0:
+                all_plans = result.loc[grp_idx, 'План_Скорр']
+                if all_plans.max() > 0:
+                    max_idx_any = all_plans.idxmax()
+                    result.loc[max_idx_any, 'План_Скорр'] += diff
             continue
         
         # Перераспределяем разницу пропорционально весам
@@ -2363,9 +2467,34 @@ def calculate_plan(df_sales, corrections=None, role_coefficients=None, limits=No
             # Финальная корректировка остатка на крупнейшем
             new_sum = result.loc[grp_idx, 'План_Скорр'].sum()
             final_residual = target - new_sum
-            if abs(final_residual) >= ROUNDING_STEP:
+            
+            # Большой остаток (>= 10000) — добавляем к некорректированному
+            if abs(final_residual) >= ROUNDING_STEP and len(adjustable_idx) > 0:
                 max_idx = result.loc[adjustable_idx, 'План_Скорр'].idxmax()
                 result.loc[max_idx, 'План_Скорр'] += final_residual
+            # Маленький остаток (< 10000) — добавляем к ЛЮБОМУ крупнейшему для сходимости
+            elif final_residual != 0 and abs(final_residual) < ROUNDING_STEP:
+                all_plans = result.loc[grp_idx, 'План_Скорр']
+                if all_plans.max() > 0:
+                    max_idx_any = all_plans.idxmax()
+                    result.loc[max_idx_any, 'План_Скорр'] += final_residual
+    
+    # DEBUG: Кострома Стройка - сходимость
+    kostroma_debug = result[result['Филиал'].str.contains('Кострома Стройка', na=False)]
+    with open('/tmp/debug_kostroma.txt', 'w') as df:
+        for month in [2, 12]:
+            m_data = kostroma_debug[kostroma_debug['Месяц'] == month]
+            if len(m_data) > 0:
+                target = m_data['План'].iloc[0]
+                total = m_data['План_Скорр'].sum()
+                df.write(f"Month={month}: Target={target}, Total={total}, Diff={target-total}\n")
+    
+    # DEBUG: Рыбинск Покрытия
+    ryb_debug = result[(result['Отдел'].str.contains('Покрытия напольные', na=False)) & 
+                       (result['Филиал'].str.contains('Рыбинск', na=False))]
+    with open('/tmp/debug_rybinsk_pokrytia.txt', 'w') as df:
+        for _, row in ryb_debug.iterrows():
+            df.write(f"Month={row['Месяц']}, План_Скорр={row['План_Скорр']}, План_Расч={row['План_Расч']}, Корр={row.get('Корр')}, Корр_Дельта={row.get('Корр_Дельта')}\n")
     
     # DEBUG: Final values for 2В. Металлопрокат
     metal_final = result[(result['Отдел'].str.contains('2В. Металлопрокат', na=False)) & 
@@ -4324,8 +4453,8 @@ disabled_cols = [c for c in edit_df.columns if c not in ['Корр', 'Корр±
 col_config_dynamic = {}
 for col in display_df.columns:
     if col in editable_cols:
-        if col == 'Корр': col_config_dynamic[col] = st.column_config.NumberColumn("Корр", format="%.0f")
-        else: col_config_dynamic[col] = st.column_config.NumberColumn("Корр±", format="%+d")
+        if col == 'Корр': col_config_dynamic[col] = st.column_config.NumberColumn("Корр", format="%.0f", min_value=-100000000)
+        else: col_config_dynamic[col] = st.column_config.NumberColumn("Корр±", format="%+d", min_value=-100000000)
     elif col in ignore_cols: pass
     else: col_config_dynamic[col] = st.column_config.TextColumn(col)
 
@@ -4443,24 +4572,10 @@ if changes_detected:
     new_corrections_list = list(corrections_map.values())
     save_corrections_local(new_corrections_list)
     
-    # Debounce: записываем время последнего изменения
-    import time
-    current_time = time.time()
-    st.session_state['last_correction_change'] = current_time
-    
-    # Показываем индикатор ожидания пересчёта
-    placeholder = st.empty()
-    placeholder.info("⏳ Ожидание завершения ввода... (пересчёт через 3 сек)")
-    
-    # Ждём 3 секунды
-    time.sleep(3)
-    
-    # Проверяем, не было ли новых изменений за это время
-    if st.session_state.get('last_correction_change', 0) == current_time:
-        # Новых изменений не было - пересчитываем
-        placeholder.empty()
-        st.cache_data.clear()
-        st.rerun()
+    # Показываем что сохранено и обновляем
+    st.toast("✅ Корректировка сохранена!")
+    st.cache_data.clear()
+    st.rerun()
 
 # Статистика корректировок (компактно)
 corr_count = (edited_df['Корр'].notna().sum() if 'Корр' in edited_df.columns else 0) + \
