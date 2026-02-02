@@ -155,6 +155,40 @@ def load_growth_rates_local():
         print(f"Error loading growth rates: {e}")
         return {}
 
+def load_strategic_growth_rates():
+    """Загружает годовые приросты для стратегических отделов. Возвращает dict с ключами-кортежами (Branch, Dept)."""
+    try:
+        filepath = os.path.join(DATA_DIR, 'strategic_growth_rates.json')
+        if not os.path.exists(filepath):
+            return {}
+        with open(filepath, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        growth = {}
+        for item in data:
+            branch = item.get('branch', '')
+            dept = item.get('dept', '')
+            rate = item.get('rate', 0)
+            if branch and dept:
+                growth[(branch, dept)] = rate
+        return growth
+    except Exception as e:
+        print(f"Error loading strategic growth rates: {e}")
+        return {}
+
+def save_strategic_growth_rates(rates_dict):
+    """Сохраняет годовые приросты для стратегических отделов."""
+    try:
+        filepath = os.path.join(DATA_DIR, 'strategic_growth_rates.json')
+        data = []
+        for (branch, dept), rate in rates_dict.items():
+            data.append({'branch': branch, 'dept': dept, 'rate': rate})
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception as e:
+        print(f"Error saving strategic growth rates: {e}")
+        return False
+
 # ============================================================================
 # ФУНКЦИИ РАСЧЁТА (ИЗ НОУТБУКА)
 # ============================================================================
@@ -214,10 +248,10 @@ RENOVATION_START_MONTH = 9
 INFLATION_CAP_PCT = 6
 
 # Минимальный порог плана (меньше - обнуляем)
-MIN_PLAN_THRESHOLD = 0  # Отключено по запросу
+MIN_PLAN_THRESHOLD = 30000  # Минимальный план для отдела
 
 # Шаг округления
-ROUNDING_STEP = 10000
+ROUNDING_STEP = 10000  # Шаг округления
 
 # Квартальная прогрессия роста для Дверей и Кухни
 QUARTER_PROGRESS_DOORS = {3: 0.20, 6: 0.40, 9: 0.60, 12: 1.00}
@@ -583,6 +617,13 @@ def apply_load_coefficients(df, role_coefficients):
         
         # Отделы без корректировок (можем перераспределять)
         adjustable_indices = [idx for idx in indices if not has_corr.loc[idx]]
+        
+        # Исключаем отделы с strategic_rate
+        strategic_growth_rates = load_strategic_growth_rates()
+        if strategic_growth_rates:
+            adjustable_indices = [idx for idx in adjustable_indices 
+                                  if strategic_growth_rates.get((result.loc[idx, 'Филиал'], result.loc[idx, 'Отдел'])) is None]
+        
         if not adjustable_indices:
             continue
         
@@ -920,86 +961,428 @@ def calculate_plan(df_sales, corrections=None, role_coefficients=None, limits=No
     # Создаем маппинг целей: (Филиал, Месяц) -> План
     target_map = df_plans.groupby(['Филиал', 'Месяц'])['План'].sum().to_dict()
     
+    # Спец-форматы для правила +6% (только для них применяется минимальный рост)
     SPECIAL_FORMATS = ['Мини', 'Микро', 'Интернет', 'Интернет магазин']
     
-    # 2. Фильтруем данные спец-форматов
-    special_mask = df_master['Формат'].isin(SPECIAL_FORMATS)
-    if special_mask.any():
-        growth_rates = load_growth_rates_local()
-        
-        # Получаем подмножество данных
-        df_spec = df_master[special_mask].copy()
-        
-        # Роль уже определена в df_master выше (через role_map)
-        
-        # --- РАСЧЁТ СОПУТСТВУЮЩИХ ---
-        # Функция получения прироста
-        def get_growth(row):
-            if row['Роль'] != 'Сопутствующий':
-                return 0
-            return growth_rates.get((row['Филиал'], row['Отдел']), 0) / 100.0
+    # 2. ЛОГИКА ДЛЯ ВСЕХ ФОРМАТОВ: Сначала сопутствующие, потом стратегические
+    # (Раньше было только для спец-форматов, теперь для ВСЕХ)
+    growth_rates = load_growth_rates_local()
+    
+    # Получаем ВСЕ данные (не только спец-форматы)
+    df_all = df_master.copy()
+    
+    # Роль уже определена в df_master выше (через role_map)
+    
+    # Определяем спец-форматы (Мини/Микро/Интернет) - для них используем сетевую сезонность
+    is_special_format = df_all['Формат'].isin(SPECIAL_FORMATS)
+    
+    # --- РАСЧЁТ СОПУТСТВУЮЩИХ ---
+    # Функция получения прироста (дефолт 0% если не указано)
+    def get_growth(row):
+        if row['Роль'] != 'Сопутствующий':
+            return 0
+        return growth_rates.get((row['Филиал'], row['Отдел']), 0) / 100.0
 
-        df_spec['Growth_Rate'] = df_spec.apply(get_growth, axis=1)
+    df_all['Growth_Rate'] = df_all.apply(get_growth, axis=1)
+    
+    # Предварительный расчёт "Теоретического плана" (база для распределения)
+    # Для СПЕЦ-ФОРМАТОВ: Base = Факт_Год × Сезонность_Сети  
+    # Для ОСТАЛЬНЫХ: Base = Rev_2025_Norm (нормализованные продажи месяца)
+    df_all['Base_Plan'] = np.where(
+        is_special_format,
+        df_all['Rev_2025_Year'] * df_all['Seasonality_Share'],  # Мини/Микро/Интернет - сетевая сезонность
+        df_all['Rev_2025_Norm']  # Остальные - факт 2025 нормализованный
+    )
+    
+    # План Сопутствующих (фиксированный)
+    # Для СПЕЦ-ФОРМАТОВ: Calc_Plan = Base_Plan × (1 + Прирост) — помесячно
+    # Для ОСТАЛЬНЫХ: growth_rate применяется к ГОДУ, затем распределяется по месяцам
+    #   Годовой_План = Rev_2025_Year × (1 + growth_rate)
+    #   Месячный_План = Годовой_План × (Rev_2025_Norm / Rev_2025_Year)
+    #   Это эквивалентно: Rev_2025_Norm × (1 + growth_rate)
+    df_all['Calc_Plan'] = 0.0
+    acc_mask = df_all['Роль'] == 'Сопутствующий'
+    
+    # Для спец-форматов: помесячный расчёт
+    acc_special = acc_mask & is_special_format
+    df_all.loc[acc_special, 'Calc_Plan'] = df_all.loc[acc_special, 'Base_Plan'] * (1 + df_all.loc[acc_special, 'Growth_Rate'])
+    
+    # Для остальных форматов: годовой прирост × месячная доля
+    # Calc_Plan = Rev_2025_Year × (1 + growth_rate) × (Rev_2025_Norm / Rev_2025_Year)
+    # Упрощается до: Rev_2025_Norm × (1 + growth_rate)
+    # НО! Важно: при балансировке в месяцы падения план сжимается.
+    # Поэтому нужно компенсировать в месяцы роста.
+    # Для этого рассчитаем "идеальный" план на год и распределим по структуре
+    acc_other = acc_mask & ~is_special_format
+    df_all.loc[acc_other, 'Calc_Plan'] = df_all.loc[acc_other, 'Rev_2025_Norm'] * (1 + df_all.loc[acc_other, 'Growth_Rate'])
+    
+    # --- РАСЧЁТ СТРАТЕГИЧЕСКИХ (С остатка) ---
+    # Группируем по Филиал-Месяц
+    strat_mask = df_all['Роль'] != 'Сопутствующий'
+    
+    # Предрасчёт: сумма нормализованной выручки 2025 по филиалу-месяцу
+    fact_2025_by_branch_month = df_all.groupby(['Филиал', 'Месяц'])['Rev_2025_Norm'].sum().to_dict()
+    
+    # Предрасчёт: сумма базы сопутствующих и стратегических по филиалу-месяцу
+    acc_base_sums = df_all[acc_mask].groupby(['Филиал', 'Месяц'])['Base_Plan'].sum().to_dict()
+    strat_base_sums = df_all[strat_mask].groupby(['Филиал', 'Месяц'])['Base_Plan'].sum().to_dict()
+    
+    # Предрасчёт: сумма планов сопутствующих (с приростом) по филиалу-месяцу  
+    acc_calc_sums = df_all[acc_mask].groupby(['Филиал', 'Месяц'])['Calc_Plan'].sum().to_dict()
+    
+    # DEBUG: для отслеживания расчётов
+    debug_list = []
+    
+    # 3. Распределяем план в зависимости от роста/падения филиала
+    def calc_plan_by_format(row):
+        branch, month = row['Филиал'], row['Месяц']
+        target = target_map.get((branch, month), 0)
+        fact_2025 = fact_2025_by_branch_month.get((branch, month), 0)
+        is_special = row['Формат'] in SPECIAL_FORMATS
         
-        # Предварительный расчёт "Теоретического плана" (база для распределения)
-        # Base = Факт_Год * Сезонность
-        df_spec['Base_Plan'] = df_spec['Rev_2025_Year'] * df_spec['Seasonality_Share']
+        # Если таргета нет, фаллбэк на базу
+        if target <= 0:
+            return row['Base_Plan']
         
-        # План Сопутствующих (фиксированный)
-        df_spec['Calc_Plan'] = 0.0
-        acc_mask = df_spec['Роль'] == 'Сопутствующий'
-        df_spec.loc[acc_mask, 'Calc_Plan'] = df_spec.loc[acc_mask, 'Base_Plan'] * (1 + df_spec.loc[acc_mask, 'Growth_Rate'])
-        
-        # --- РАСЧЁТ СТРАТЕГИЧЕСКИХ (С остатка) ---
-        # Группируем по Филиал-Месяц
-        strat_mask = df_spec['Роль'] != 'Сопутствующий'
-        
-        # 1. Сумма планов сопутствующих по филиалу и месяцу
-        acc_sums = df_spec[acc_mask].groupby(['Филиал', 'Месяц'])['Calc_Plan'].sum().to_dict()
-        
-        # 2. Сумма базы стратегических (знаменатель для долей)
-        strat_base_sums = df_spec[strat_mask].groupby(['Филиал', 'Месяц'])['Base_Plan'].sum().to_dict()
-        
-        # 3. Распределяем остаток
-        def calc_strategic(row):
+        # ========== СПЕЦ-ФОРМАТЫ (Мини/Микро/Интернет) ==========
+        # Логика: Сначала сопутствующие (фиксированные), потом стратегические (остаток)
+        if is_special:
             if row['Роль'] == 'Сопутствующий':
                 return row['Calc_Plan']
-            
-            branch, month = row['Филиал'], row['Месяц']
-            target = target_map.get((branch, month), 0)
-            
-            # Если таргета нет, фаллбэк на базу (как будто рост 0)
-            if target <= 0:
-                return row['Base_Plan']
-                
-            acc_sum = acc_sums.get((branch, month), 0)
-            residual = target - acc_sum
-            
-            # Если остаток отрицательный (сопутствующие съели всё), стратегическим 0 (или минимум?)
-            if residual < 0:
-                residual = 0
-            
-            strat_total = strat_base_sums.get((branch, month), 0)
-            
-            if strat_total > 0:
-                share = row['Base_Plan'] / strat_total
-                return residual * share
             else:
+                # Стратегические получают остаток
+                acc_sum = acc_calc_sums.get((branch, month), 0)
+                residual = max(0, target - acc_sum)
+                strat_total = strat_base_sums.get((branch, month), 0)
+                if strat_total > 0:
+                    share = row['Base_Plan'] / strat_total
+                    return residual * share
                 return 0
         
-        # Применяем расчёт
-        df_spec['Final_Plan'] = df_spec.apply(calc_strategic, axis=1)
+        # ========== ОСТАЛЬНЫЕ ФОРМАТЫ ==========
+        # Определяем прирост/падение филиала
+        if fact_2025 > 0:
+            branch_growth = (target / fact_2025) - 1  # Например: -0.05 = падение 5%
+        else:
+            branch_growth = 0
         
-        # Заносим в precalc_plans
-        for idx, row in df_spec.iterrows():
-            precalc_plans[(row['Филиал'], row['Отдел'], row['Месяц'])] = row['Final_Plan']
+        # ПАДЕНИЕ филиала:
+        # 1. Стратегические = уровень 2025 (не падают)
+        # 2. Сопутствующие = Таргет - Σ Стратегических (терпят убыток в этом месяце)
+        if branch_growth < 0:
+            if row['Роль'] != 'Сопутствующий':
+                # Стратегические: уровень 2025
+                return row['Base_Plan']
+            else:
+                # Сопутствующие: получают остаток (Таргет - Σ Стратегических)
+                strat_total = strat_base_sums.get((branch, month), 0)
+                residual = max(0, target - strat_total)
+                
+                # Распределяем остаток пропорционально Base_Plan сопутствующих
+                acc_base_total = acc_base_sums.get((branch, month), 0)
+                if acc_base_total > 0:
+                    share = row['Base_Plan'] / acc_base_total
+                    return residual * share
+                return 0
+        
+        # РОСТ филиала:
+        # 1. Сопутствующие = Calc_Plan (с growth_rate) - будет скорректировано позже
+        # 2. Стратегические = Таргет - Σ Сопутствующих
+        else:
+            if row['Роль'] == 'Сопутствующий':
+                return row['Calc_Plan']
+            else:
+                # Стратегические получают остаток
+                acc_sum = acc_calc_sums.get((branch, month), 0)
+                residual = max(0, target - acc_sum)
+                strat_total = strat_base_sums.get((branch, month), 0)
+                if strat_total > 0:
+                    share = row['Base_Plan'] / strat_total
+                    return residual * share
+                return 0
+    
+    # Применяем расчёт (Фаза 1)
+    df_all['Final_Plan'] = df_all.apply(calc_plan_by_format, axis=1)
+    
+    # ========== ФАЗА 2: Корректировка сопутствующих для достижения годового growth_rate ==========
+    # Для каждого сопутствующего отдела в НЕ спец-формате:
+    # 1. Посчитать годовой итог Final_Plan
+    # 2. Сравнить с целевым: Rev_2025_Year × (1 + growth_rate)
+    # 3. Разницу распределить по месяцам РОСТА пропорционально их Base_Plan
+    
+    acc_other_mask = (df_all['Роль'] == 'Сопутствующий') & (~df_all['Формат'].isin(SPECIAL_FORMATS))
+    
+    if acc_other_mask.any():
+        # Группируем по Филиал-Отдел
+        for (branch, dept), group in df_all[acc_other_mask].groupby(['Филиал', 'Отдел']):
+            # Годовой итог текущий
+            current_year_sum = group['Final_Plan'].sum()
+            
+            # Целевой годовой план = Rev_2025_Year × (1 + growth_rate)
+            rev_2025_year = group['Rev_2025_Year'].iloc[0] if 'Rev_2025_Year' in group.columns else group['Rev_2025_Norm'].sum()
+            growth_rate = group['Growth_Rate'].iloc[0] if 'Growth_Rate' in group.columns else 0
+            target_year_sum = rev_2025_year * (1 + growth_rate)
+            
+            # Разница (сколько нужно добавить)
+            diff = target_year_sum - current_year_sum
+            
+            if abs(diff) > 10000:  # Корректируем только если разница значительная
+                # Находим месяцы РОСТА филиала
+                for idx, row in group.iterrows():
+                    month = row['Месяц']
+                    fact_2025_m = fact_2025_by_branch_month.get((branch, month), 0)
+                    target_m = target_map.get((branch, month), 0)
+                    
+                    if fact_2025_m > 0:
+                        br_growth = (target_m / fact_2025_m) - 1
+                    else:
+                        br_growth = 0
+                    
+                    df_all.loc[idx, '_is_growth_month'] = (br_growth >= 0)
+                
+                # Сумма Base_Plan в месяцы роста
+                growth_months_mask = df_all.index.isin(group[df_all.loc[group.index, '_is_growth_month'] == True].index)
+                growth_base_sum = df_all.loc[growth_months_mask, 'Base_Plan'].sum()
+                
+                if growth_base_sum > 0:
+                    # Распределяем diff пропорционально Base_Plan в месяцы роста
+                    for idx in group.index:
+                        if df_all.loc[idx, '_is_growth_month']:
+                            share = df_all.loc[idx, 'Base_Plan'] / growth_base_sum
+                            adjustment = diff * share
+                            df_all.loc[idx, 'Final_Plan'] += adjustment
+    
+    # Убираем временную колонку
+    if '_is_growth_month' in df_all.columns:
+        df_all.drop('_is_growth_month', axis=1, inplace=True)
+    
+    # ========== ФАЗА 3: Пересчёт стратегических после корректировки сопутствующих ==========
+    # В месяцы РОСТА: стратегические = Таргет - Σ Сопутствующих (после корректировки)
+    strat_other_mask = (df_all['Роль'] != 'Сопутствующий') & (~df_all['Формат'].isin(SPECIAL_FORMATS))
+    
+    if strat_other_mask.any():
+        # Пересчитываем суммы сопутствующих после корректировки
+        acc_final_sums = df_all[acc_mask].groupby(['Филиал', 'Месяц'])['Final_Plan'].sum().to_dict()
+        
+        for idx in df_all[strat_other_mask].index:
+            row = df_all.loc[idx]
+            branch, month = row['Филиал'], row['Месяц']
+            target = target_map.get((branch, month), 0)
+            fact_2025 = fact_2025_by_branch_month.get((branch, month), 0)
+            
+            if fact_2025 > 0:
+                br_growth = (target / fact_2025) - 1
+            else:
+                br_growth = 0
+            
+            # Только в месяцы РОСТА пересчитываем
+            if br_growth >= 0:
+                acc_sum = acc_final_sums.get((branch, month), 0)
+                residual = max(0, target - acc_sum)
+                strat_total = strat_base_sums.get((branch, month), 0)
+                
+                if strat_total > 0:
+                    share = row['Base_Plan'] / strat_total
+                    df_all.loc[idx, 'Final_Plan'] = residual * share
+    
+    # Логика: strategic_growth_rates задаёт АБСОЛЮТНЫЙ годовой прирост для стратегических
+    # Годовой План = Факт_2025_Year × (1 + rate%)
+    # Распределяется по месяцам пропорционально Base_Plan
+    # Остальные стратегические получают остаток
+    
+    strategic_growth_rates = load_strategic_growth_rates()
+    
+    if strategic_growth_rates:
+        # Отделы, которые не участвуют в перераспределении
+        excluded_strat_depts = ['9. Двери, фурнитура дверная', 'Мебель для кухни']
+        
+        # Группируем по Филиал-Отдел для расчёта годового плана
+        strat_mask = (df_all['Роль'] != 'Сопутствующий') & (~df_all['Отдел'].isin(excluded_strat_depts))
+        
+        # Для каждого отдела с заданным rate: рассчитываем годовой план
+        debug_phase4 = []
+        for (branch, dept), dept_group in df_all[strat_mask].groupby(['Филиал', 'Отдел']):
+            rate = strategic_growth_rates.get((branch, dept))
+            
+            if rate is None:
+                continue  # Этот отдел не имеет заданного rate
+            
+            # Годовой план = Факт_2025_Year × (1 + rate%)
+            rev_2025_year = dept_group['Rev_2025_Year'].iloc[0] if 'Rev_2025_Year' in dept_group.columns else dept_group['Base_Plan'].sum()
+            target_year = rev_2025_year * (1 + rate / 100.0)
+            
+            # Общий Base_Plan для распределения по месяцам
+            total_base = dept_group['Base_Plan'].sum()
+            
+            debug_phase4.append({
+                'branch': str(branch),
+                'dept': str(dept),
+                'rate': float(rate),
+                'rev_2025_year': float(rev_2025_year),
+                'target_year': float(target_year),
+                'total_base': float(total_base),
+                'months': len(dept_group)
+            })
+            
+            if total_base > 0:
+                # Распределяем годовой план по месяцам пропорционально Base_Plan
+                for idx, row in dept_group.iterrows():
+                    monthly_share = row['Base_Plan'] / total_base
+                    df_all.loc[idx, 'Final_Plan'] = target_year * monthly_share
+        
+        # Сохраняем debug
+        if debug_phase4:
+            import json
+            with open('/tmp/debug_phase4_new.json', 'w') as f:
+                json.dump(debug_phase4, f, ensure_ascii=False, indent=2)
+        
+        # Теперь для каждого Филиал-Месяц: пересчитываем остальных стратегических
+        # Они получают остаток (Таргет - Σ Сопутствующих - Σ Стратегических_с_rate)
+        for (branch, month), group in df_all.groupby(['Филиал', 'Месяц']):
+            target = target_map.get((branch, month), 0)
+            if target <= 0:
+                continue
+            
+            # Сумма сопутствующих
+            acc_sum = group[group['Роль'] == 'Сопутствующий']['Final_Plan'].sum()
+            
+            # Сумма стратегических С rate (исключая Двери/Кухни)
+            strat_with_rate_mask = (
+                (group['Роль'] != 'Сопутствующий') & 
+                (~group['Отдел'].isin(excluded_strat_depts)) &
+                group.apply(lambda r: strategic_growth_rates.get((branch, r['Отдел'])) is not None, axis=1)
+            )
+            strat_with_rate_sum = group.loc[strat_with_rate_mask, 'Final_Plan'].sum()
+            
+            # Сумма Двери + Кухни (фиксированные)
+            doors_kitchens = group[group['Отдел'].isin(excluded_strat_depts)]['Final_Plan'].sum()
+            
+            # Остаток для стратегических БЕЗ rate
+            residual = max(0, target - acc_sum - strat_with_rate_sum - doors_kitchens)
+            
+            # Стратегические БЕЗ rate
+            strat_without_rate_mask = (
+                (group['Роль'] != 'Сопутствующий') & 
+                (~group['Отдел'].isin(excluded_strat_depts)) &
+                group.apply(lambda r: strategic_growth_rates.get((branch, r['Отдел'])) is None, axis=1)
+            )
+            
+            strat_without_rate = group[strat_without_rate_mask]
+            if len(strat_without_rate) > 0 and residual > 0:
+                total_base = strat_without_rate['Base_Plan'].sum()
+                for idx in strat_without_rate.index:
+                    if total_base > 0:
+                        share = group.loc[idx, 'Base_Plan'] / total_base
+                        df_all.loc[idx, 'Final_Plan'] = residual * share
+                    else:
+                        df_all.loc[idx, 'Final_Plan'] = 0
+    
+    # DEBUG: 1А. Сантехника инженерная
+    import json
+    if debug_list:
+        with open('/tmp/debug_santeh_inj.json', 'w', encoding='utf-8') as f:
+            json.dump(debug_list, f, ensure_ascii=False, indent=2)
+    
+    # DEBUG: Вологда
+    import json
+    vologda_debug = df_all[df_all['Филиал'].str.contains('Вологда', na=False) & (df_all['Месяц'] == 1)][
+        ['Филиал', 'Отдел', 'Месяц', 'Роль', 'Формат', 'Rev_2025_Norm', 'Base_Plan', 'Final_Plan']
+    ].head(20).to_dict('records')
+    
+    # Также добавим таргет и факт для Вологды
+    vologda_targets = {k: v for k, v in target_map.items() if 'Вологда' in k[0] and k[1] == 1}
+    vologda_facts = {k: v for k, v in fact_2025_by_branch_month.items() if 'Вологда' in k[0] and k[1] == 1}
+    
+    with open('/tmp/debug_vologda.json', 'w', encoding='utf-8') as f:
+        json.dump({
+            'target_map': {f"{k[0]}|{k[1]}": v for k, v in vologda_targets.items()},
+            'fact_2025': {f"{k[0]}|{k[1]}": v for k, v in vologda_facts.items()},
+            'departments': vologda_debug
+        }, f, ensure_ascii=False, indent=2)
+    
+    # ========== ОКРУГЛЕНИЕ И МИНИМУМ ДЛЯ ВСЕХ ФОРМАТОВ ==========
+    # Округляем все планы до ROUNDING_STEP
+    df_all['Final_Plan'] = (df_all['Final_Plan'] / ROUNDING_STEP).round(0) * ROUNDING_STEP
+    
+    # Применяем минимум: план < MIN_PLAN_THRESHOLD → 0
+    below_min_mask = (df_all['Final_Plan'] > 0) & (df_all['Final_Plan'] < MIN_PLAN_THRESHOLD)
+    
+    # Сохраняем освобождённые суммы по филиал-месяц
+    freed_by_group = {}
+    for (branch, month), grp in df_all[below_min_mask].groupby(['Филиал', 'Месяц']):
+        freed_by_group[(branch, month)] = grp['Final_Plan'].sum()
+    
+    # Обнуляем маленькие планы
+    df_all.loc[below_min_mask, 'Final_Plan'] = 0
+    
+    # Перераспределяем освобождённое
+    for (branch, month), freed_amount in freed_by_group.items():
+        if freed_amount > 0:
+            # Определяем формат филиала
+            branch_mask = (df_all['Филиал'] == branch) & (df_all['Месяц'] == month)
+            format_val = df_all.loc[branch_mask, 'Формат'].iloc[0] if branch_mask.any() else None
+            is_special = format_val in SPECIAL_FORMATS
+            
+            # Для остальных форматов с падением: перераспределяем на сопутствующих
+            rev_sum = df_all.loc[branch_mask, 'Rev_2025_Norm'].sum()
+            target_val = target_map.get((branch, month), 0)
+            branch_growth = (target_val / rev_sum - 1) if rev_sum > 0 else 0
+            
+            if (not is_special) and (branch_growth < 0):
+                # На сопутствующих
+                acc_in_group = branch_mask & (df_all['Роль'] == 'Сопутствующий') & (df_all['Final_Plan'] >= MIN_PLAN_THRESHOLD)
+            else:
+                # На стратегических
+                acc_in_group = branch_mask & (df_all['Роль'] == 'Стратегический') & (df_all['Final_Plan'] >= MIN_PLAN_THRESHOLD)
+            
+            if acc_in_group.any():
+                max_idx = df_all.loc[acc_in_group, 'Final_Plan'].idxmax()
+                df_all.loc[max_idx, 'Final_Plan'] += freed_amount
+    
+    # Заносим в precalc_plans
+    for idx, row in df_all.iterrows():
+        precalc_plans[(row['Филиал'], row['Отдел'], row['Месяц'])] = row['Final_Plan']
 
-    # DEBUG: Записываем precalc_plans в файл
-    with open('/tmp/precalc_debug.txt', 'w') as f:
-        f.write(f"Total precalc entries: {len(precalc_plans)}\n")
-        for key, val in precalc_plans.items():
-            if 'Владимир' in str(key[0]):
-                f.write(f"{key}: {val:,.0f}\n")
+    # DEBUG: Записываем precalc_plans и детали для 2В. Металлопрокат
+    import json
+    debug_data = {
+        'total_entries': len(precalc_plans),
+        'metalloprokkt': [],
+        'santeh_inj': [],
+        'pokrytiya': [],
+        'oboi': []
+    }
+    for key, val in precalc_plans.items():
+        if '2В. Металлопрокат' in str(key[1]) and 'Владимир' in str(key[0]):
+            debug_data['metalloprokkt'].append({
+                'branch': key[0],
+                'dept': key[1],
+                'month': key[2],
+                'plan': val
+            })
+        if '1А. Сантехника' in str(key[1]) and 'Вологда' in str(key[0]):
+            debug_data['santeh_inj'].append({
+                'branch': key[0],
+                'dept': key[1],
+                'month': key[2],
+                'plan': val
+            })
+        if '5. Покрытия' in str(key[1]) and 'Владимир Лента' in str(key[0]):
+            debug_data['pokrytiya'].append({
+                'branch': key[0],
+                'dept': key[1],
+                'month': key[2],
+                'plan': val
+            })
+        if '4. Обои' in str(key[1]) and 'Владимир Лента' in str(key[0]):
+            debug_data['oboi'].append({
+                'branch': key[0],
+                'dept': key[1],
+                'month': key[2],
+                'plan': val
+            })
+    with open('/tmp/debug_metalloprokkat.json', 'w') as f:
+        json.dump(debug_data, f, ensure_ascii=False, indent=2)
 
     # ========== ШАГ 12: Распределение плана по отделам ==========
     
@@ -1027,19 +1410,38 @@ def calculate_plan(df_sales, corrections=None, role_coefficients=None, limits=No
         target = int(round(target))
         
         g = group.copy()
+        
+        # DEBUG: trace 2В. Металлопрокат in Владимир Лента
+        metalloprokkat_rows = g[g['Отдел'].str.contains('2В. Металлопрокат', na=False)]
+        if 'Владимир Лента' in branch and len(metalloprokkat_rows) > 0:
+            with open('/tmp/step12_metal_debug.txt', 'a') as df:
+                for idx, row in metalloprokkat_rows.iterrows():
+                    precalc_key = (row['Филиал'], row['Отдел'], row['Месяц'])
+                    precalc_val = precalc_plans.get(precalc_key, 'NOT_FOUND')
+                    df.write(f"Month={month}, Dept={row['Отдел']}, precalc={precalc_val}, Formат={row.get('Формат', 'N/A')}, Роль={row.get('Роль', 'N/A')}\n")
+        
         weights = g['Final_Weight'].copy()
         manual_fixed_mask = has_correction(g) # Только ручные
         no_plan_mask = g['_is_no_plan']
         
-        # Определяем, кто является спец-форматом в этой группе
+        # Определяем, кто является спец-форматом (для правила +6%)
         is_special = g['Формат'].isin(SPECIAL_FORMATS)
         
-        # Логика для спец-форматов:
-        # 1. Сопутствующие -> ФИКСИРОВАННЫЕ (как ручные, берем из precalc)
+        # Логика для ВСЕХ форматов:
+        # 1. Сопутствующие -> ФИКСИРОВАННЫЕ (берем из precalc)
         # 2. Стратегические -> АКТИВНЫЕ (участвуют в балансировке под таргет)
         roles = g['Роль'] if 'Роль' in g.columns else pd.Series('Стратегический', index=g.index)
-        is_spec_accomp = is_special & (roles == 'Сопутствующий') & ~no_plan_mask
-        is_spec_strat = is_special & (roles != 'Сопутствующий') & ~no_plan_mask
+        
+        # Сопутствующие ВСЕХ форматов теперь фиксированные
+        is_accomp = (roles == 'Сопутствующий') & ~no_plan_mask
+        is_strat = (roles != 'Сопутствующий') & ~no_plan_mask
+        
+        # Стратегические с заданным strategic_growth_rate тоже фиксируются (из precalc Фаза 4)
+        strategic_growth_rates = load_strategic_growth_rates()
+        has_strat_rate = pd.Series(False, index=g.index)
+        for idx, row in g.iterrows():
+            if strategic_growth_rates.get((row['Филиал'], row['Отдел'])) is not None:
+                has_strat_rate[idx] = True
         
         # ВАЖНО: Веса для Стратегических НЕ переопределяем!
         # Используем оригинальные Final_Weight (из Step 8), основанные на правилах/продажах.
@@ -1047,10 +1449,63 @@ def calculate_plan(df_sales, corrections=None, role_coefficients=None, limits=No
         # сохраняя сезонность таргета (а не сетевую сезонность).
         # precalc используется только для Сопутствующих (fixed).
 
-        # Общая маска фиксации: Ручные ИЛИ (Спец-форматы И Сопутствующие)
-        # Стратегические спец-форматы теперь АКТИВНЫЕ!
-        fixed_mask = manual_fixed_mask | is_spec_accomp
-        active_mask = ~fixed_mask & ~no_plan_mask
+        # Общая маска фиксации: Ручные ИЛИ Сопутствующие ИЛИ Стратегические с rate (любого формата)
+        fixed_mask = manual_fixed_mask | is_accomp | has_strat_rate
+        
+        # DEBUG: Покрытия во Владимир Лента
+        if 'Владимир Лента' in branch and month == 1:
+            pok_rows = g[g['Отдел'].str.contains('Покрытия', na=False)]
+            if len(pok_rows) > 0:
+                import json
+                debug_step12_pok = []
+                for idx, row in pok_rows.iterrows():
+                    pk = (row['Филиал'], row['Отдел'], row['Месяц'])
+                    debug_step12_pok.append({
+                        'dept': str(row['Отдел']),
+                        'has_strat_rate': bool(has_strat_rate[idx]) if idx in has_strat_rate.index else False,
+                        'fixed_mask': bool(fixed_mask[idx]) if idx in fixed_mask.index else False,
+                        'precalc_key': str(pk),
+                        'precalc_value': float(precalc_plans.get(pk, -1)),
+                        'strategic_rate': strategic_growth_rates.get((row['Филиал'], row['Отдел']))
+                    })
+                with open('/tmp/debug_step12_pokrytiya.json', 'w') as f:
+                    json.dump(debug_step12_pok, f, ensure_ascii=False, indent=2)
+        
+        # DEBUG: Обои во Владимир Лента
+        if 'Владимир Лента' in branch and month == 1:
+            oboi_rows = g[g['Отдел'].str.contains('Обои', na=False)]
+            if len(oboi_rows) > 0:
+                import json
+                debug_step12_oboi = []
+                for idx, row in oboi_rows.iterrows():
+                    pk = (row['Филиал'], row['Отдел'], row['Месяц'])
+                    debug_step12_oboi.append({
+                        'dept': str(row['Отдел']),
+                        'has_strat_rate': bool(has_strat_rate[idx]) if idx in has_strat_rate.index else False,
+                        'fixed_mask': bool(fixed_mask[idx]) if idx in fixed_mask.index else False,
+                        'precalc_key': str(pk),
+                        'precalc_value': float(precalc_plans.get(pk, -1)),
+                        'strategic_rate': strategic_growth_rates.get((row['Филиал'], row['Отдел']))
+                    })
+                with open('/tmp/debug_step12_oboi.json', 'w') as f:
+                    json.dump(debug_step12_oboi, f, ensure_ascii=False, indent=2)
+        
+        # Для остальных форматов с ПАДЕНИЕМ: ВСЕ фиксированы из precalc
+        # (Стратегические = уровень 2025, Сопутствующие = с приростом)
+        format_val = g['Формат'].iloc[0] if 'Формат' in g.columns else None
+        is_special_format = format_val in SPECIAL_FORMATS
+        
+        # Рассчитываем рост/падение филиала
+        rev_2025_sum = g['Rev_2025_Norm'].sum() if 'Rev_2025_Norm' in g.columns else 0
+        branch_growth_pct = (target / rev_2025_sum - 1) if rev_2025_sum > 0 else 0
+        
+        # При ПАДЕНИИ в остальных форматах: ВСЕ фиксированы из precalc
+        if (not is_special_format) and (branch_growth_pct < 0):
+            # Все = FIXED (из precalc, который уже рассчитан в calc_plan_by_format)
+            fixed_mask = ~no_plan_mask  # Все кроме "не считаем план"
+            active_mask = pd.Series(False, index=g.index)  # Никто не балансирует
+        else:
+            active_mask = ~fixed_mask & ~no_plan_mask
 
         # Теоретический план (для всего, нужно для fallback)
         total_weight = weights.sum()
@@ -1099,12 +1554,37 @@ def calculate_plan(df_sales, corrections=None, role_coefficients=None, limits=No
                     final = base
                 
                 # Apply Rounding and Threshold rules (Standardized)
-                # Округляем до ближайших 10000 (по запросу пользователя)
-                final_rounded = round(final / ROUNDING_STEP) * ROUNDING_STEP
-                
-                # 3. Apply minimum threshold (если включен)
-                if final_rounded < MIN_PLAN_THRESHOLD:
+                # Если исходное значение < 10000 — обнуляем (не округляем вверх)
+                if final < ROUNDING_STEP:
                     final_rounded = 0
+                else:
+                    # Округляем до ближайших 10000 (стандартное математическое)
+                    final_rounded = round(final / ROUNDING_STEP) * ROUNDING_STEP
+                
+                # Apply minimum threshold: план < 30000 → обнуляем
+                if final_rounded > 0 and final_rounded < MIN_PLAN_THRESHOLD:
+                    final_rounded = 0
+                
+                # DEBUG: trace for 2В. Металлопрокат
+                if '2В. Металлопрокат' in str(g.loc[idx, 'Отдел']) and 'Владимир Лента' in str(g.loc[idx, 'Филиал']):
+                    with open('/tmp/step12_debug.txt', 'a') as df:
+                        df.write(f"Month={g.loc[idx, 'Месяц']}, precalc_key={precalc_key}, is_precalc={is_precalc}, base={base}, final={final}, final_rounded={final_rounded}\n")
+                
+                # DEBUG: trace for 1А. Сантехника
+                if '1А. Сантехника' in str(g.loc[idx, 'Отдел']) and 'Вологда' in str(g.loc[idx, 'Филиал']):
+                    with open('/tmp/step12_santeh.json', 'a') as df:
+                        import json as j
+                        j.dump({'month': int(g.loc[idx, 'Месяц']), 'is_precalc': is_precalc, 'base': float(base), 
+                                'final': float(final), 'final_rounded': float(final_rounded), 'fixed': bool(fixed_mask.loc[idx])}, df)
+                        df.write('\n')
+                
+                # DEBUG: trace for 4. Обои
+                if '4. Обои' in str(g.loc[idx, 'Отдел']) and 'Владимир Лента' in str(g.loc[idx, 'Филиал']):
+                    with open('/tmp/step12_oboi_fixed.json', 'a') as df:
+                        import json as j
+                        j.dump({'month': int(g.loc[idx, 'Месяц']), 'is_precalc': is_precalc, 'base': float(base), 
+                                'final': float(final), 'final_rounded': float(final_rounded)}, df)
+                        df.write('\n')
                 
                 g.loc[idx, 'План_Расч'] = final_rounded
 
@@ -1112,6 +1592,15 @@ def calculate_plan(df_sales, corrections=None, role_coefficients=None, limits=No
         actual_fixed = g.loc[fixed_mask, 'План_Расч'].sum() if fixed_mask.any() else 0
         actual_no_plan = g.loc[no_plan_without_corr, 'План_Расч'].sum() if no_plan_without_corr.any() else 0
         remaining_target = target - actual_fixed - actual_no_plan
+
+        # DEBUG: балансировка
+        if is_special.any() and 'Владимир' in str(branch):
+            with open('/tmp/balance_debug.txt', 'a') as f:
+                f.write(f"\n=== {branch}, Месяц {month} ===\n")
+                f.write(f"Target: {target}\n")
+                f.write(f"Fixed (Сопутствующие): {actual_fixed}\n")
+                f.write(f"Remaining for Стратегических: {remaining_target}\n")
+                f.write(f"Fixed count: {fixed_mask.sum()}, Active count: {active_mask.sum()}\n")
 
         if active_mask.any() and remaining_target > 0:
             weights_active = weights.loc[active_mask].copy()
@@ -1221,6 +1710,12 @@ def calculate_plan(df_sales, corrections=None, role_coefficients=None, limits=No
                 max_idx = active_plans.idxmax()
                 g.loc[max_idx, 'План_Расч'] += final_diff
         
+        # DEBUG: После Smart Rounding
+        if is_special.any() and 'Владимир' in str(branch) and month == 1:
+            with open('/tmp/balance_debug.txt', 'a') as f:
+                total_after_rounding = g['План_Расч'].sum()
+                f.write(f"\nПосле Smart Rounding: {total_after_rounding} (Target: {target}, Diff: {target - total_after_rounding})\n")
+        
         # ========== ПРАВИЛО: Минимум +6% для спец-форматов ==========
         # Для Мини, Микро, Интернет: План не может быть меньше Факт_2025 * 1.06
         # ИСКЛЮЧЕНИЕ: если месяц был максимальным по продажам за год — правило не применяется
@@ -1269,10 +1764,89 @@ def calculate_plan(df_sales, corrections=None, role_coefficients=None, limits=No
                     if g.loc[idx, 'План_Расч'] < min_plan_rounded:
                         g.loc[idx, 'План_Расч'] = min_plan_rounded
         
+        # ========== ПЕРЕБАЛАНСИРОВКА ПОСЛЕ +6% ==========
+        # Если правило +6% создало избыток, уменьшаем Стратегических
+        current_sum = g['План_Расч'].sum()
+        excess = current_sum - target
+        
+        if excess > 0 and is_special.any():
+            # Находим Стратегических в спец-форматах
+            strat_special = is_special & (roles == 'Стратегический')
+            
+            if strat_special.any():
+                strat_plans = g.loc[strat_special, 'План_Расч'].sum()
+                
+                if strat_plans > excess:
+                    # Уменьшаем пропорционально, НО исключаем отделы с strategic_rate
+                    strategic_growth_rates_inner = load_strategic_growth_rates()
+                    reduction_ratio = (strat_plans - excess) / strat_plans
+                    for idx in g.index[strat_special]:
+                        dept = g.loc[idx, 'Отдел']
+                        branch_name = g.loc[idx, 'Филиал']
+                        # Пропускаем отделы с strategic_rate
+                        if strategic_growth_rates_inner.get((branch_name, dept)) is not None:
+                            continue
+                        new_plan = g.loc[idx, 'План_Расч'] * reduction_ratio
+                        # Округляем
+                        g.loc[idx, 'План_Расч'] = round(new_plan / step) * step
+                    
+                    # Финальная корректировка остатка к максимальному плану
+                    final_sum = g['План_Расч'].sum()
+                    final_diff = target - final_sum
+                    if final_diff != 0:
+                        strat_plans_after = g.loc[strat_special, 'План_Расч']
+                        if not strat_plans_after.empty and strat_plans_after.max() > 0:
+                            max_idx = strat_plans_after.idxmax()
+                            g.loc[max_idx, 'План_Расч'] += final_diff
+        
+        # DEBUG: Полный JSON для Владимир Лента
+        if is_special.any() and 'Владимир Лента' in str(branch):
+            import json
+            debug_data = {
+                'branch': str(branch),
+                'month': int(month),
+                'target': int(target),
+                'fixed_sum': float(g.loc[fixed_mask, 'План_Расч'].sum()) if fixed_mask.any() else 0,
+                'active_sum': float(g.loc[active_mask, 'План_Расч'].sum()) if active_mask.any() else 0,
+                'total_sum': float(g['План_Расч'].sum()),
+                'diff': float(target - g['План_Расч'].sum()),
+                'fixed_count': int(fixed_mask.sum()),
+                'active_count': int(active_mask.sum()),
+                'departments': []
+            }
+            for idx in g.index:
+                dept_info = {
+                    'dept': str(g.loc[idx, 'Отдел']),
+                    'role': str(g.loc[idx, 'Роль']) if 'Роль' in g.columns else 'N/A',
+                    'plan': float(g.loc[idx, 'План_Расч']),
+                    'rev_2025': float(g.loc[idx, 'Rev_2025']) if 'Rev_2025' in g.columns else 0,
+                    'is_fixed': bool(fixed_mask.loc[idx]) if idx in fixed_mask.index else False,
+                    'is_active': bool(active_mask.loc[idx]) if idx in active_mask.index else False
+                }
+                debug_data['departments'].append(dept_info)
+            
+            with open('/tmp/balance_full_debug.json', 'a') as f:
+                f.write(json.dumps(debug_data, ensure_ascii=False) + '\n')
+        
         # Чистим временные колонки
         for col in ['_theoretical', 'raw_plan', 'diff_val']:
             if col in g.columns:
                 g = g.drop(columns=[col])
+
+        # DEBUG: Все филиалы с расхождением
+        final_diff_check = target - g['План_Расч'].sum()
+        if abs(final_diff_check) > 1000:  # Расхождение > 1000 руб
+            import json
+            with open('/tmp/divergence_debug.json', 'a') as f:
+                debug_info = {
+                    'branch': str(branch),
+                    'month': int(month),
+                    'target': int(target),
+                    'actual': float(g['План_Расч'].sum()),
+                    'diff': float(final_diff_check),
+                    'is_special': bool(is_special.any())
+                }
+                f.write(json.dumps(debug_info, ensure_ascii=False) + '\n')
 
         results.append(g)
 
@@ -1286,6 +1860,23 @@ def calculate_plan(df_sales, corrections=None, role_coefficients=None, limits=No
     # Для работы apply функций нужна колонка План_Скорр (они работают с ней)
     result['План_Скорр'] = result['План_Расч'].copy()
     
+    # Сохраняем План_Расч для отделов с strategic_rate из precalc_plans (Фаза 4)
+    # НЕ из result, т.к. Step 12 перебалансировка уже могла изменить значения
+    strategic_growth_rates_preserve = load_strategic_growth_rates()
+    preserved_plans = {}
+    if strategic_growth_rates_preserve:
+        for (branch, dept), rate in strategic_growth_rates_preserve.items():
+            for m in range(1, 13):  # Все 12 месяцев
+                key = (branch, dept, m)
+                if key in precalc_plans:
+                    preserved_plans[key] = precalc_plans[key]
+    
+    # DEBUG: что сохраняется для Обои
+    oboi_preserved = sum(v for k, v in preserved_plans.items() 
+                          if 'Обои' in str(k[1]) and 'Владимир Лента' in str(k[0]))
+    with open('/tmp/debug_oboi_preserved.txt', 'w') as f:
+        f.write(f"Oboi preserved: {oboi_preserved:,.0f}\n")
+    
     apply_doors_smooth_growth(result)
     apply_kitchen_smooth_growth(result)
     # result = apply_min_plan_network(result)  # Отключено по запросу — минимальный план не применяется
@@ -1296,6 +1887,16 @@ def calculate_plan(df_sales, corrections=None, role_coefficients=None, limits=No
     
     # Возвращаем изменения в переменную расчета для балансировки
     result['План_Расч'] = result['План_Скорр']
+    
+    # Восстанавливаем План_Расч для отделов с strategic_rate
+    for (branch, dept, month_val), plan_val in preserved_plans.items():
+        mask = (result['Филиал'] == branch) & (result['Отдел'] == dept) & (result['Месяц'] == month_val)
+        result.loc[mask, 'План_Расч'] = plan_val
+
+    # DEBUG: Oboi после восстановления, до Step 13
+    oboi_before_step13 = result[(result['Филиал'] == 'Владимир Лента') & (result['Отдел'].str.contains('Обои', na=False))]['План_Расч'].sum()
+    with open('/tmp/debug_oboi_before_step13.txt', 'w') as f:
+        f.write(f"Oboi before Step 13: {oboi_before_step13:,.0f}\n")
 
     # ========== ШАГ 13: ФИНАЛЬНАЯ БАЛАНСИРОВКА ==========
     # Проверяем сходимость по каждому филиалу/месяцу и перераспределяем остаток
@@ -1303,10 +1904,8 @@ def calculate_plan(df_sales, corrections=None, role_coefficients=None, limits=No
     for (branch, month), group in result.groupby(['Филиал', 'Месяц']):
         idx = group.index
         
-        # Для спец-форматов НЕ делаем балансировку — их план уже рассчитан по сезонности
-        branch_format = result.loc[idx, 'Формат'].iloc[0] if 'Формат' in result.columns else None
-        if branch_format in SPECIAL_FORMATS:
-            continue
+        # ВАЖНО: Финальная балансировка для ВСЕХ форматов
+        # Промежуточные правила (smooth growth, компрессор) могут нарушить сходимость
         
         target = result.loc[idx, 'План'].iloc[0]
         if pd.isna(target):
@@ -1319,16 +1918,66 @@ def calculate_plan(df_sales, corrections=None, role_coefficients=None, limits=No
         if diff == 0:
             continue
         
+        # DEBUG: Log all branches with non-zero diff for step 13
+        if 'Вологда' in branch and month == 1:
+            import json
+            debug_step13_diff = {
+                'branch': branch, 'month': int(month),
+                'target': float(target), 'current_sum': float(current_sum), 'diff': float(diff)
+            }
+            with open('/tmp/debug_step13_diff.json', 'w', encoding='utf-8') as f:
+                json.dump(debug_step13_diff, f, ensure_ascii=False, indent=2)
+        
         # Находим активные отделы
         # ИСКЛЮЧАЯ те, которые имеют ручные корректировки (мы должны сохранить их значения)
         group_slice = result.loc[idx]
         fixed_mask = has_correction(group_slice)
         
-        active_mask = (group_slice['План_Расч'] > 0) & (~fixed_mask)
+        # Стратегические с strategic_growth_rate тоже фиксированы
+        strategic_growth_rates = load_strategic_growth_rates()
+        if strategic_growth_rates:
+            for i, row in group_slice.iterrows():
+                if strategic_growth_rates.get((row['Филиал'], row['Отдел'])) is not None:
+                    fixed_mask.loc[i] = True
+        
+        # Определяем, нужно ли исключить стратегических из балансировки
+        # Для НЕ спец-форматов с падением: стратегические фиксированы
+        is_special_branch = group_slice['Формат'].iloc[0] in SPECIAL_FORMATS if 'Формат' in group_slice.columns else False
+        
+        # Рассчитываем прирост/падение филиала
+        rev_2025_sum = group_slice['Rev_2025'].sum() if 'Rev_2025' in group_slice.columns else 0
+        branch_growth = (target / rev_2025_sum - 1) if rev_2025_sum > 0 else 0
+        
+        # Для остальных форматов с падением: стратегические НЕ участвуют в балансировке
+        exclude_strategic = (not is_special_branch) and (branch_growth < 0)
+        
+        # DEBUG: Log for Vologda
+        if 'Вологда' in branch and month == 1:
+            import json
+            debug_step13 = {
+                'branch': str(branch), 'month': int(month),
+                'target': float(target), 'current_sum': float(current_sum), 'diff': float(diff),
+                'is_special_branch': bool(is_special_branch),
+                'branch_growth': float(branch_growth),
+                'exclude_strategic': bool(exclude_strategic),
+                'format': str(group_slice['Формат'].iloc[0]) if 'Формат' in group_slice.columns else 'N/A'
+            }
+            with open('/tmp/debug_step13.json', 'w', encoding='utf-8') as f:
+                json.dump(debug_step13, f, ensure_ascii=False, indent=2)
+        
+        # Для остальных форматов с падением: ВСЕ фиксированы, пропускаем балансировку
+        if exclude_strategic:
+            # Все уже фиксированы из precalc, не балансируем
+            continue
+        else:
+            active_mask = (group_slice['План_Расч'] > 0) & (~fixed_mask)
+        
         active_idx = idx[active_mask]
         
         if len(active_idx) == 0:
-            active_idx = idx 
+            # Если нет активных сопутствующих, балансируем только не-фиксированных
+            # НЕ включаем отделы с strategic_rate!
+            continue  # Пропускаем — все уже фиксированы
         
         # === ИТЕРАТИВНОЕ РАСПРЕДЕЛЕНИЕ С УЧЕТОМ ЛИМИТОВ (WATER FILLING) ===
         
@@ -1421,19 +2070,17 @@ def calculate_plan(df_sales, corrections=None, role_coefficients=None, limits=No
              dist_weights = (weights / w_sum) if w_sum > 0 else pd.Series(1, index=all_active)
              result.loc[all_active, 'План_Расч'] += remaining_diff * dist_weights
 
-        # Округление до ROUNDING_STEP (только для НЕ спец-форматов!)
-        # Спец-форматы должны сохранить точную сезонность
-        is_special = result.loc[active_idx, 'Формат'].isin(SPECIAL_FORMATS) if 'Формат' in result.columns else pd.Series(False, index=active_idx)
-        non_special_idx = active_idx[~is_special]
-        
-        if len(non_special_idx) > 0:
-            # 1. Округляем до ближайших 10000 (только обычные форматы)
-            current_vals = result.loc[non_special_idx, 'План_Расч']
+        # Округление до ROUNDING_STEP для ВСЕХ форматов
+        # (ранее спец-форматы пропускались, что ломало округление)
+        if len(active_idx) > 0:
+            # 1. Округляем до ближайших 10000
+            current_vals = result.loc[active_idx, 'План_Расч']
+            # Стандартное математическое округление до 10000
             rounded_vals = (current_vals / ROUNDING_STEP).round(0) * ROUNDING_STEP
             
             # 2. Обнуляем те, что меньше порога
             rounded_vals = np.where(rounded_vals < MIN_PLAN_THRESHOLD, 0, rounded_vals)
-            result.loc[non_special_idx, 'План_Расч'] = rounded_vals
+            result.loc[active_idx, 'План_Расч'] = rounded_vals
         
         # 3. Балансируем разницу (остаток должен быть кратен шагу, так как target тоже кратен или округляем и его)
         # target уже округлен до целого, но не обязательно до 10к.
@@ -1459,29 +2106,297 @@ def calculate_plan(df_sales, corrections=None, role_coefficients=None, limits=No
                 if candidates_w.sum() == 0:
                      candidates_w = result.loc[active_idx, 'План_Расч']
                 
-                # Если все активные обнулились из-за порога, ищем кого вернуть к жизни
-                if candidates_w.sum() == 0 and len(active_idx) > 0:
-                    max_w_idx = active_idx[0] # Просто первый попавшийся
-                elif len(active_idx) > 0:
-                    max_w_idx = candidates_w.idxmax()
+                # Если все активные обнулились из-за порога — НЕ добавляем к ним diff!
+                # Это создаст маленькие планы < 30000
+                # Вместо этого, ищем отдел с планом >= 30000
+                active_with_plan = active_idx[result.loc[active_idx, 'План_Расч'] >= MIN_PLAN_THRESHOLD]
+                
+                if len(active_with_plan) > 0:
+                    max_w_idx = result.loc[active_with_plan, 'План_Расч'].idxmax()
+                elif len(active_idx) > 0 and diff_rounded >= MIN_PLAN_THRESHOLD:
+                    # Если diff сам по себе >= 30000, можем создать новый план
+                    max_w_idx = active_idx[0]
                 else:
                     max_w_idx = None
 
                 if max_w_idx:
-                    # Проверяем, не станет ли он < порога (если был 0, а мы вычитаем - нельзя)
-                    # Если добавляем положительное - ок.
-                    # Если вычитаем - надо следить.
-                    
                     val = result.loc[max_w_idx, 'План_Расч'] + diff_rounded
-                    if val >= MIN_PLAN_THRESHOLD or val == 0: 
-                         result.loc[max_w_idx, 'План_Расч'] = val
-                    elif val > 0: # val < 30000 -> 30000
-                         # Если не лезет в минимум, то либо 30000 либо 0
-                         # Лучше поставим минимум, если разница позволяет
-                         result.loc[max_w_idx, 'План_Расч'] = MIN_PLAN_THRESHOLD
+                    
+                    # Проверяем минимум: если результат < 30000, но > 0 — ставим 30000
+                    if val >= MIN_PLAN_THRESHOLD:
+                        result.loc[max_w_idx, 'План_Расч'] = val
+                    elif val == 0:
+                        result.loc[max_w_idx, 'План_Расч'] = 0
+                    elif val > 0:
+                        # val < 30000 — ставим минимум
+                        result.loc[max_w_idx, 'План_Расч'] = MIN_PLAN_THRESHOLD
+            
+            # Маленький остаток (< 10000) — добавляем к крупнейшему отделу
+            # Только для него нарушаем округление, остальные остаются кратными 10000
+            final_sum = result.loc[idx, 'План_Расч'].sum()
+            final_residual = target - final_sum
+            
+            if final_residual != 0 and abs(final_residual) < ROUNDING_STEP:
+                # Находим отдел с максимальным планом
+                plans = result.loc[idx, 'План_Расч']
+                if plans.max() > 0:
+                    max_plan_idx = plans.idxmax()
+                    result.loc[max_plan_idx, 'План_Расч'] += final_residual
+
+    # ========== ШАГ 13.5: ПРАВИЛО +6% ДЛЯ СОПУТСТВУЮЩИХ (после балансировки) ==========
+    # Для спец-форматов: Сопутствующие должны иметь минимум +6% к Факту_2025
+    # ИСКЛЮЧЕНИЕ: максимальный месяц по продажам
+    # ИСКЛЮЧЕНИЕ 2: если в таблице приростов указано значение < 0
+    MIN_GROWTH_FINAL = 0.06  # +6%
+    
+    # Загружаем таблицу приростов для проверки отрицательных значений
+    growth_rates_for_rule = {}
+    growth_file = os.path.join(DATA_DIR, 'growth_rates.json')
+    if os.path.exists(growth_file):
+        try:
+            with open(growth_file, 'r', encoding='utf-8') as f:
+                growth_data = json.load(f)
+                for item in growth_data:
+                    growth_rates_for_rule[(item['branch'], item['dept'])] = item['rate']
+        except:
+            pass
+    
+    for (branch, month), group in result.groupby(['Филиал', 'Месяц']):
+        grp_idx = group.index
+        
+        # Только для спец-форматов
+        branch_format = result.loc[grp_idx, 'Формат'].iloc[0] if 'Формат' in result.columns else None
+        if branch_format not in SPECIAL_FORMATS:
+            continue
+        
+        target = result.loc[grp_idx, 'План'].iloc[0]
+        if pd.isna(target):
+            continue
+        target = int(round(target))
+        
+        total_increase = 0  # Сколько добавили Сопутствующим
+        
+        for idx in grp_idx:
+            role = result.loc[idx, 'Роль'] if 'Роль' in result.columns else 'Стратегический'
+            if role != 'Сопутствующий':
+                continue
+            
+            # Используем нормализованную выручку если есть (для филиалов на ремонте)
+            rev_2025_norm = result.loc[idx, 'Rev_2025_Norm'] if 'Rev_2025_Norm' in result.columns else None
+            rev_2025 = result.loc[idx, 'Rev_2025'] if 'Rev_2025' in result.columns else 0
+            
+            # Для расчёта используем нормализованную выручку (учитывает ремонт)
+            base_rev = rev_2025_norm if (pd.notna(rev_2025_norm) and rev_2025_norm > 0) else rev_2025
+            
+            if pd.isna(base_rev) or base_rev <= 0:
+                continue
+            
+            dept = result.loc[idx, 'Отдел']
+            branch_name = result.loc[idx, 'Филиал']
+            
+            # Получаем кастомный прирост из таблицы
+            custom_growth = growth_rates_for_rule.get((branch_name, dept))
+            
+            # Если прирост отрицательный — применяем его (уменьшаем план)
+            if custom_growth is not None and custom_growth < 0:
+                # Например: -20 означает план = База * 0.80 (используем нормализованную выручку)
+                target_plan = base_rev * (1 + custom_growth / 100)  # custom_growth уже в процентах
+                target_plan_rounded = int(round(target_plan / ROUNDING_STEP)) * ROUNDING_STEP
+                
+                # Обнуляем если < 30000
+                if target_plan_rounded < MIN_PLAN_THRESHOLD:
+                    target_plan_rounded = 0
+                
+                current_plan = result.loc[idx, 'План_Расч']
+                
+                if current_plan > target_plan_rounded:
+                    # Уменьшаем план — освобождаем сумму для стратегических
+                    freed = current_plan - target_plan_rounded
+                    result.loc[idx, 'План_Расч'] = target_plan_rounded
+                    total_increase -= freed  # Отрицательное — значит освободили
+                continue
+            
+            # Проверяем: максимальный месяц? (используем фактическую выручку для сравнения)
+            max_rev_year = max_rev_2025_by_branch_dept.get((branch_name, dept), 0)
+            is_max_month = (rev_2025 >= max_rev_year * 0.999)
+            
+            if is_max_month:
+                continue  # Для max месяца +6% не применяем
+            
+            # Используем нормализованную выручку для расчёта +6%
+            min_plan = base_rev * (1 + MIN_GROWTH_FINAL)
+            min_plan_rounded = int(round(min_plan / ROUNDING_STEP)) * ROUNDING_STEP
+            
+            # Обнуляем если < 30000
+            if min_plan_rounded < MIN_PLAN_THRESHOLD:
+                min_plan_rounded = 0
+            
+            current_plan = result.loc[idx, 'План_Расч']
+            
+            if current_plan < min_plan_rounded:
+                increase = min_plan_rounded - current_plan
+                result.loc[idx, 'План_Расч'] = min_plan_rounded
+                total_increase += increase
+        
+        # Перераспределяем: + = уменьшаем стратегических, - = увеличиваем стратегических
+        if total_increase != 0:
+            strat_mask = (result.loc[grp_idx, 'Роль'] == 'Стратегический') & (result.loc[grp_idx, 'План_Расч'] > 0)
+            strat_idx = grp_idx[strat_mask]
+            
+            if len(strat_idx) > 0:
+                # Исключаем отделы с strategic_rate
+                strategic_growth_rates_inner = load_strategic_growth_rates()
+                adjustable_strat = []
+                for idx in strat_idx:
+                    dept = result.loc[idx, 'Отдел']
+                    branch_name = result.loc[idx, 'Филиал']
+                    if strategic_growth_rates_inner.get((branch_name, dept)) is None:
+                        adjustable_strat.append(idx)
+                
+                strat_idx = pd.Index(adjustable_strat)
+                
+                if len(strat_idx) == 0:
+                    continue  # Все стратегические фиксированы по rate
+                
+                # Изменяем пропорционально весам
+                strat_plans = result.loc[strat_idx, 'План_Расч']
+                total_strat = strat_plans.sum()
+                
+                if total_strat > 0:
+                    shares = strat_plans / total_strat
+                    # total_increase > 0 — уменьшаем стратегических
+                    # total_increase < 0 — увеличиваем стратегических (освободили от сопутствующих)
+                    delta = shares * total_increase
+                    result.loc[strat_idx, 'План_Расч'] -= delta
+                    
+                    # Стандартное округление Стратегических
+                    result.loc[strat_idx, 'План_Расч'] = (result.loc[strat_idx, 'План_Расч'] / ROUNDING_STEP).round(0) * ROUNDING_STEP
+                    
+                    # Обнуляем те, что меньше порога (< 30000) и перераспределяем
+                    below_min = result.loc[strat_idx, 'План_Расч'] < MIN_PLAN_THRESHOLD
+                    below_min_idx = strat_idx[below_min]
+                    if len(below_min_idx) > 0:
+                        freed_amount = result.loc[below_min_idx, 'План_Расч'].sum()
+                        result.loc[below_min_idx, 'План_Расч'] = 0
+                        # Добавляем освободившуюся сумму к крупнейшему
+                        remaining_strat = strat_idx[~below_min]
+                        if len(remaining_strat) > 0:
+                            max_strat_idx = result.loc[remaining_strat, 'План_Расч'].idxmax()
+                            result.loc[max_strat_idx, 'План_Расч'] += freed_amount
+                    
+                    # Корректируем остаток на крупнейшем
+                    new_sum = result.loc[grp_idx, 'План_Расч'].sum()
+                    residual = target - new_sum
+                    if residual != 0:
+                        # Находим крупнейший отдел (любой роли) с планом > 0
+                        active_plans = result.loc[grp_idx, 'План_Расч']
+                        active_nonzero = active_plans[active_plans >= MIN_PLAN_THRESHOLD]
+                        if len(active_nonzero) > 0:
+                            max_idx = active_nonzero.idxmax()
+                            result.loc[max_idx, 'План_Расч'] += residual
 
     # ========== ШАГ 14: Финализация ==========
     result['План_Скорр'] = result['План_Расч'].copy()
+    
+    # ПРИМЕНЕНИЕ РУЧНЫХ КОРРЕКТИРОВОК
+    # Корр — абсолютное значение плана (включая 0)
+    if 'Корр' in result.columns:
+        # Применяем если Корр указан (не NaN), включая значение 0
+        corr_mask = result['Корр'].notna()
+        if corr_mask.any():
+            result.loc[corr_mask, 'План_Скорр'] = result.loc[corr_mask, 'Корр']
+    
+    # Корр_Дельта — дельта к расчётному плану (применяется если нет абсолютной корректировки)
+    if 'Корр_Дельта' in result.columns:
+        delta_mask = result['Корр_Дельта'].notna() & (result['Корр_Дельта'] != 0)
+        # Применяем дельту только если нет абсолютной корректировки
+        if 'Корр' in result.columns:
+            delta_mask = delta_mask & result['Корр'].isna()
+        if delta_mask.any():
+            result.loc[delta_mask, 'План_Скорр'] = result.loc[delta_mask, 'План_Расч'] + result.loc[delta_mask, 'Корр_Дельта']
+    
+    # Убедимся что План_Скорр >= 0
+    result['План_Скорр'] = result['План_Скорр'].clip(lower=0)
+    
+    # ПЕРЕБАЛАНСИРОВКА после корректировок для сохранения сходимости
+    # Для каждого филиала/месяца: если сумма изменилась из-за корректировок, 
+    # перераспределяем разницу на некорректированные отделы
+    for (branch, month), group in result.groupby(['Филиал', 'Месяц']):
+        grp_idx = group.index
+        
+        target = result.loc[grp_idx, 'План'].iloc[0]
+        if pd.isna(target) or target <= 0:
+            continue
+        target = int(round(target))
+        
+        current_sum = result.loc[grp_idx, 'План_Скорр'].sum()
+        diff = target - current_sum
+        
+        if abs(diff) < 1000:  # Мелкие расхождения игнорируем
+            continue
+        
+        # Определяем отделы с ручными корректировками (их не трогаем)
+        # Корр указан (включая 0) = корректировка есть
+        has_corr = result.loc[grp_idx, 'Корр'].notna() if 'Корр' in result.columns else pd.Series(False, index=grp_idx)
+        has_delta = (result.loc[grp_idx, 'Корр_Дельта'].notna() & (result.loc[grp_idx, 'Корр_Дельта'] != 0)) if 'Корр_Дельта' in result.columns else pd.Series(False, index=grp_idx)
+        is_corrected = has_corr | has_delta
+        
+        # Некорректированные отделы с планом > MIN_PLAN_THRESHOLD
+        adjustable_mask = ~is_corrected & (result.loc[grp_idx, 'План_Скорр'] >= MIN_PLAN_THRESHOLD)
+        adjustable_idx = grp_idx[adjustable_mask]
+        
+        if len(adjustable_idx) == 0:
+            continue
+        
+        # Перераспределяем разницу пропорционально весам
+        adjustable_plans = result.loc[adjustable_idx, 'План_Скорр']
+        total_adjustable = adjustable_plans.sum()
+        
+        if total_adjustable > 0:
+            shares = adjustable_plans / total_adjustable
+            adjustment = shares * diff
+            result.loc[adjustable_idx, 'План_Скорр'] += adjustment
+            
+            # Округляем
+            result.loc[adjustable_idx, 'План_Скорр'] = (result.loc[adjustable_idx, 'План_Скорр'] / ROUNDING_STEP).round(0) * ROUNDING_STEP
+            
+            # Финальная корректировка остатка на крупнейшем
+            new_sum = result.loc[grp_idx, 'План_Скорр'].sum()
+            final_residual = target - new_sum
+            if abs(final_residual) >= ROUNDING_STEP:
+                max_idx = result.loc[adjustable_idx, 'План_Скорр'].idxmax()
+                result.loc[max_idx, 'План_Скорр'] += final_residual
+    
+    # DEBUG: Final values for 2В. Металлопрокат
+    metal_final = result[(result['Отдел'].str.contains('2В. Металлопрокат', na=False)) & 
+                         (result['Филиал'].str.contains('Владимир Лента', na=False))]
+    with open('/tmp/final_metal_debug.txt', 'w') as df:
+        for _, row in metal_final.iterrows():
+            df.write(f"Month={row['Месяц']}, План_Скорр={row['План_Скорр']}, План_Расч={row['План_Расч']}\n")
+    
+    # DEBUG: Вологда финальные значения
+    import json
+    vologda_final = result[(result['Филиал'].str.contains('Вологда', na=False)) & (result['Месяц'] == 1)][
+        ['Филиал', 'Отдел', 'Роль', 'Rev_2025', 'План_Скорр', 'План_Расч']
+    ].copy()
+    vologda_final['Прирост_%'] = ((vologda_final['План_Скорр'] / vologda_final['Rev_2025']) - 1) * 100
+    vologda_final = vologda_final.round(1).to_dict('records')
+    
+    with open('/tmp/debug_vologda_final.json', 'w', encoding='utf-8') as f:
+        json.dump(vologda_final, f, ensure_ascii=False, indent=2)
+    
+    # DEBUG: Владимир Лента отделы с rate
+    vlad_oboi = result[(result['Филиал'] == 'Владимир Лента') & (result['Отдел'].str.contains('Обои', na=False))].copy()
+    vlad_oboi_sum = vlad_oboi['План_Расч'].sum()
+    vlad_oboi_rev = vlad_oboi['Rev_2025'].sum() if 'Rev_2025' in vlad_oboi.columns else 0
+    with open('/tmp/debug_vlad_oboi.json', 'w') as f:
+        json.dump({
+            'year_plan': float(vlad_oboi_sum),
+            'year_rev_2025': float(vlad_oboi_rev),
+            'growth_pct': float((vlad_oboi_sum / vlad_oboi_rev - 1) * 100) if vlad_oboi_rev > 0 else 0,
+            'months': len(vlad_oboi),
+            'precalc_target': 13070000  # from precalc
+        }, f, indent=2)
 
     # DEBUG: Проверяем финальные значения
     debug_df = result[(result['Филиал'] == 'Владимир Лента') & (result['Отдел'] == '1А. Сантехника инженерная')]
@@ -1523,6 +2438,26 @@ def calculate_plan(df_sales, corrections=None, role_coefficients=None, limits=No
         (result['План_Скорр'] / year_plan_by_dept) * 100,
         0.0
     )
+    
+    # Годовой прирост отдела (План_Год / Факт_2025_Год - 1) × 100
+    # Одинаковое значение для всех месяцев в рамках (Филиал, Отдел)
+    year_fact_by_dept = result.groupby(['Филиал', 'Отдел'])['Rev_2025'].transform('sum')
+    result['Прирост_Год_%'] = np.where(
+        year_fact_by_dept > 0,
+        ((year_plan_by_dept / year_fact_by_dept) - 1) * 100,
+        0.0
+    )
+    result['Прирост_Год_%'] = result['Прирост_Год_%'].round(1)
+    
+    # DEBUG: Проверка колонки Прирост_Год_%
+    import json
+    debug_growth_year = {
+        'column_exists': 'Прирост_Год_%' in result.columns,
+        'all_columns': list(result.columns),
+        'sample_values': result[['Филиал', 'Отдел', 'Месяц', 'Прирост_Год_%']].head(20).to_dict('records') if 'Прирост_Год_%' in result.columns else []
+    }
+    with open('/tmp/debug_growth_year.json', 'w', encoding='utf-8') as f:
+        json.dump(debug_growth_year, f, ensure_ascii=False, indent=2)
     
     # Рекомендуемый план (План_Расч до корректировок) 
     result['Рекоменд'] = result['План_Расч'].copy()
@@ -2281,7 +3216,7 @@ all_columns_full = ['Филиал', 'Отдел', 'Мес', 'Роль', 'Фор�
                'Корр', 'Корр±', 'Авто_Корр',
                'План_Скорр', 'План_Расч', 'План', '_План_Расч_Исх', 'Рекоменд',
                'Выручка_2025', 'Выручка_2024', 'Выручка_2025_Норм',
-               'Прирост_%', 'Прирост_24_26_%',
+               'Прирост_%', 'Прирост_24_26_%', 'Прирост_Год_%',
                'Сезонность_Факт', 'Сезонность_План',
                'Площадь_2025', 'Площадь_2026', 'Δ_Площадь_%',
                'Отдача_План', 'Отдача_2025', 'Δ_Отдача_%',
@@ -2366,26 +3301,33 @@ total_fact = df['Rev_2025'].sum()
 total_fact_24 = df['Rev_2024'].sum()
 
 # ========== ПРОВЕРКА СХОДИМОСТИ ==========
-# Используем План из df (уже содержит целевые планы из calculate_plan)
+# Сходимость рассчитывается по ВСЕМ данным выбранных филиалов
+# Если фильтр пустой — показываем общую сходимость по ВСЕМ филиалам
 
 convergence_ok = True
 convergence_msg = ""
 convergence_details = {}
 
-if 'План' in df.columns:
+if 'План' in df_base.columns:
+    # Если филиалы не выбраны — используем ВСЕ данные
+    if len(sel_branches) > 0:
+        df_convergence = df_base[df_base['Филиал'].isin(sel_branches)].copy()
+    else:
+        df_convergence = df_base.copy()  # Все данные
+    
     # Целевой план — уникальные значения по филиалу/месяцу
-    target_by_group = df.groupby(['Филиал', 'Месяц'])['План'].first()
+    target_by_group = df_convergence.groupby(['Филиал', 'Месяц'])['План'].first()
     target_total = target_by_group.sum()
     
     # Распределённый план (сумма по отделам)
-    distributed_total = df['План_Скорр'].sum()
+    distributed_total = df_convergence['План_Скорр'].sum()
     
     # Отклонение
     deviation = distributed_total - target_total
     deviation_pct = (deviation / target_total * 100) if target_total > 0 else 0
     
     # Проверка по каждому филиалу-месяцу
-    for (branch, month), grp in df.groupby(['Филиал', 'Месяц']):
+    for (branch, month), grp in df_convergence.groupby(['Филиал', 'Месяц']):
         dept_sum = grp['План_Скорр'].sum()
         target_val = grp['План'].iloc[0]
         if pd.notna(target_val):
@@ -2926,7 +3868,7 @@ with col4:
 
 # --- НАСТРОЙКА (Лимиты и Прирост) ---
 with st.expander("⚙️ Настройка", expanded=False):
-    tab_limits, tab_growth = st.tabs(["📊 Лимиты роста", "📈 Прирост на год"])
+    tab_limits, tab_growth, tab_strat_growth = st.tabs(["📊 Лимиты роста", "📈 Прирост на год", "🎯 Прирост стратегических"])
     
     # === ВКЛАДКА 1: ЛИМИТЫ РОСТА ===
     with tab_limits:
@@ -2949,88 +3891,107 @@ with st.expander("⚙️ Настройка", expanded=False):
                     if br in all_branches and dp in all_depts:
                         df_lim_ui.at[dp, br] = val
                 
-                # Редактор
+                # Функция автосохранения при изменении
+                def save_limits_auto():
+                    """Автосохранение лимитов при изменении"""
+                    if 'limits_editor_matrix_main' in st.session_state:
+                        edited_data = st.session_state['limits_editor_matrix_main']
+                        # Получаем текущий DataFrame из сессии
+                        current_df = df_lim_ui.copy()
+                        
+                        # Применяем изменения из edited_rows
+                        if 'edited_rows' in edited_data:
+                            for row_idx, changes in edited_data['edited_rows'].items():
+                                row_label = current_df.index[int(row_idx)]
+                                for col, val in changes.items():
+                                    current_df.at[row_label, col] = val
+                        
+                        # Собираем данные для сохранения
+                        new_limits_dict = {}
+                        for dp in current_df.index:
+                            for br in current_df.columns:
+                                val = current_df.at[dp, br]
+                                if pd.notna(val) and str(val).strip() != '':
+                                    try:
+                                        f_val = float(val)
+                                        new_limits_dict[(br, dp)] = f_val
+                                    except:
+                                        pass
+                        
+                        # Сохраняем
+                        save_limits_local(new_limits_dict)
+                
+                # Редактор с автосохранением
                 edited_limits_df = st.data_editor(
                     df_lim_ui,
                     key='limits_editor_matrix_main',
                     use_container_width=True,
-                    height=400
+                    height=400,
+                    on_change=save_limits_auto
                 )
                 
-                if st.button("💾 Сохранить лимиты", type="primary", key="save_limits_btn"):
-                    new_limits_dict = {}
-                    for dp in edited_limits_df.index:
-                        for br in edited_limits_df.columns:
-                            val = edited_limits_df.at[dp, br]
-                            if pd.notna(val) and str(val).strip() != '':
-                                try:
-                                    f_val = float(val)
-                                    new_limits_dict[(br, dp)] = f_val
-                                except:
-                                    pass
-                    
-                    if save_limits_local(new_limits_dict):
-                        st.toast("Лимиты сохранены!", icon="✅")
-                        st.rerun()
+                st.caption("💡 Изменения сохраняются автоматически")
         else:
             st.info("Загрузка данных...")
     
     # === ВКЛАДКА 2: ПРИРОСТ НА ГОД ===
     with tab_growth:
-        st.caption("Годовой прирост для Сопутствующих отделов (Мини, Микро, Интернет). План = Факт 2025 × (1 + Прирост%) × Сезонность")
+        st.caption("Годовой прирост для Сопутствующих отделов. План = Факт 2025 × (1 + Прирост%) × Сезонность. Правило +6% минимум применяется только к Мини/Микро/Интернет.")
         
         # Используем df_base (полный датасет), чтобы настройки не зависели от фильтров
         target_df = df_base if 'df_base' in locals() and not df_base.empty else df
         
-        if not target_df.empty and 'Формат' in target_df.columns:
-            # Фильтруем только Мини, Микро, Интернет форматы
-            network_formats = ['Мини', 'Микро', 'Интернет', 'Интернет магазин']
-            df_network = target_df[target_df['Формат'].isin(network_formats)]
+        if not target_df.empty:
+            # Показываем ВСЕ филиалы (не только спец-форматы)
+            all_branches = sorted(target_df['Филиал'].unique())
             
-            if not df_network.empty:
-                # Получаем уникальные филиалы и отделы формата
-                network_branches = sorted(df_network['Филиал'].unique())
+            # Только Сопутствующие отделы
+            if 'Роль' in target_df.columns:
+                accomp_depts = sorted(target_df[target_df['Роль'] == 'Сопутствующий']['Отдел'].unique())
+            else:
+                accomp_depts = sorted(target_df['Отдел'].unique())
                 
-                # Только Сопутствующие отделы
-                if 'Роль' in df_network.columns:
-                    accomp_depts = sorted(df_network[df_network['Роль'] == 'Сопутствующий']['Отдел'].unique())
-                else:
-                    accomp_depts = sorted(df_network['Отдел'].unique())
+            if len(accomp_depts) > 0:
+                # Загружаем сохраненные приросты
+                growth_file = os.path.join(DATA_DIR, 'growth_rates.json')
+                saved_growth = {}
+                if os.path.exists(growth_file):
+                    try:
+                        with open(growth_file, 'r', encoding='utf-8') as f:
+                            data = json.load(f)
+                            for item in data:
+                                saved_growth[(item['branch'], item['dept'])] = item['rate']
+                    except:
+                        pass
                 
-                if len(accomp_depts) > 0:
-                    # Загружаем сохраненные приросты
-                    growth_file = os.path.join(DATA_DIR, 'growth_rates.json')
-                    saved_growth = {}
-                    if os.path.exists(growth_file):
-                        try:
-                            with open(growth_file, 'r', encoding='utf-8') as f:
-                                data = json.load(f)
-                                for item in data:
-                                    saved_growth[(item['branch'], item['dept'])] = item['rate']
-                        except:
-                            pass
-                    
-                    # Строим DataFrame для редактора
-                    df_growth_ui = pd.DataFrame(index=accomp_depts, columns=network_branches)
-                    
-                    # Заполняем сохраненные значения
-                    for (br, dp), val in saved_growth.items():
-                        if br in network_branches and dp in accomp_depts:
-                            df_growth_ui.at[dp, br] = val
-                    
-                    # Редактор прироста
-                    edited_growth_df = st.data_editor(
-                        df_growth_ui,
-                        key='growth_editor_matrix',
-                        use_container_width=True,
-                        height=400
-                    )
-                    
-                    if st.button("💾 Сохранить прирост", type="primary", key="save_growth_btn"):
+                # Строим DataFrame для редактора
+                df_growth_ui = pd.DataFrame(index=accomp_depts, columns=all_branches)
+                
+                # Заполняем сохраненные значения
+                for (br, dp), val in saved_growth.items():
+                    if br in all_branches and dp in accomp_depts:
+                        df_growth_ui.at[dp, br] = val
+                
+                # Функция автосохранения при изменении
+                def save_growth_auto():
+                    """Автосохранение приростов при изменении"""
+                    if 'growth_editor_matrix' in st.session_state:
+                        edited_data = st.session_state['growth_editor_matrix']
+                        # Получаем текущий DataFrame из сессии
+                        current_df = df_growth_ui.copy()
+                        
+                        # Применяем изменения из edited_rows
+                        if 'edited_rows' in edited_data:
+                            for row_idx, changes in edited_data['edited_rows'].items():
+                                row_label = current_df.index[int(row_idx)]
+                                for col, val in changes.items():
+                                    current_df.at[row_label, col] = val
+                        
+                        # Собираем данные для сохранения
                         new_growth_list = []
-                        for dp in edited_growth_df.index:
-                            for br in edited_growth_df.columns:
-                                val = edited_growth_df.at[dp, br]
+                        for dp in current_df.index:
+                            for br in current_df.columns:
+                                val = current_df.at[dp, br]
                                 if pd.notna(val) and str(val).strip() != '':
                                     try:
                                         f_val = float(val)
@@ -3046,14 +4007,114 @@ with st.expander("⚙️ Настройка", expanded=False):
                         try:
                             with open(growth_file, 'w', encoding='utf-8') as f:
                                 json.dump(new_growth_list, f, ensure_ascii=False, indent=2)
-                            st.toast("Приросты сохранены!", icon="✅")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Ошибка сохранения: {e}")
-                else:
-                    st.info("Нет сопутствующих отделов в выбранных форматах")
+                        except:
+                            pass
+                
+                # Редактор прироста с автосохранением
+                edited_growth_df = st.data_editor(
+                    df_growth_ui,
+                    key='growth_editor_matrix',
+                    use_container_width=True,
+                    height=400,
+                    on_change=save_growth_auto
+                )
+                
+                st.caption("💡 Изменения сохраняются автоматически")
             else:
-                st.info("Нет данных по форматам Мини/Микро/Интернет")
+                st.info("Нет сопутствующих отделов")
+        else:
+            st.info("Загрузка данных...")
+    
+    # === ВКЛАДКА 3: ПРИРОСТ СТРАТЕГИЧЕСКИХ ===
+    with tab_strat_growth:
+        st.caption("Годовой прирост для Стратегических отделов. Увеличение прироста одного отдела уменьшает другие пропорционально. Не влияет на ручные корректировки и методику Дверей/Кухонь.")
+        
+        # Используем df_base (полный датасет), чтобы настройки не зависели от фильтров
+        target_df = df_base if 'df_base' in locals() and not df_base.empty else df
+        
+        if not target_df.empty:
+            # Показываем ВСЕ филиалы
+            all_branches = sorted(target_df['Филиал'].unique())
+            
+            # Только Стратегические отделы (исключаем Двери и Кухни)
+            excluded_depts = ['9. Двери, фурнитура дверная', 'Мебель для кухни']
+            if 'Роль' in target_df.columns:
+                strat_depts = sorted([d for d in target_df[target_df['Роль'] != 'Сопутствующий']['Отдел'].unique() 
+                                     if d not in excluded_depts])
+            else:
+                strat_depts = sorted([d for d in target_df['Отдел'].unique() if d not in excluded_depts])
+                
+            if len(strat_depts) > 0:
+                # Загружаем сохраненные приросты
+                strat_growth_file = os.path.join(DATA_DIR, 'strategic_growth_rates.json')
+                saved_strat_growth = {}
+                if os.path.exists(strat_growth_file):
+                    try:
+                        with open(strat_growth_file, 'r', encoding='utf-8') as f:
+                            data = json.load(f)
+                            for item in data:
+                                saved_strat_growth[(item['branch'], item['dept'])] = item['rate']
+                    except:
+                        pass
+                
+                # Строим DataFrame для редактора
+                df_strat_growth_ui = pd.DataFrame(index=strat_depts, columns=all_branches)
+                
+                # Заполняем сохраненные значения
+                for (br, dp), val in saved_strat_growth.items():
+                    if br in all_branches and dp in strat_depts:
+                        df_strat_growth_ui.at[dp, br] = val
+                
+                # Функция автосохранения при изменении
+                def save_strat_growth_auto():
+                    """Автосохранение приростов стратегических при изменении"""
+                    if 'strat_growth_editor_matrix' in st.session_state:
+                        edited_data = st.session_state['strat_growth_editor_matrix']
+                        # Получаем текущий DataFrame из сессии
+                        current_df = df_strat_growth_ui.copy()
+                        
+                        # Применяем изменения из edited_rows
+                        if 'edited_rows' in edited_data:
+                            for row_idx, changes in edited_data['edited_rows'].items():
+                                row_label = current_df.index[int(row_idx)]
+                                for col, val in changes.items():
+                                    current_df.at[row_label, col] = val
+                        
+                        # Собираем данные для сохранения
+                        new_strat_growth_list = []
+                        for dp in current_df.index:
+                            for br in current_df.columns:
+                                val = current_df.at[dp, br]
+                                if pd.notna(val) and str(val).strip() != '':
+                                    try:
+                                        f_val = float(val)
+                                        new_strat_growth_list.append({
+                                            'branch': br,
+                                            'dept': dp,
+                                            'rate': f_val
+                                        })
+                                    except:
+                                        pass
+                        
+                        # Сохраняем
+                        try:
+                            with open(strat_growth_file, 'w', encoding='utf-8') as f:
+                                json.dump(new_strat_growth_list, f, ensure_ascii=False, indent=2)
+                        except:
+                            pass
+                
+                # Редактор прироста с автосохранением
+                edited_strat_growth_df = st.data_editor(
+                    df_strat_growth_ui,
+                    key='strat_growth_editor_matrix',
+                    use_container_width=True,
+                    height=400,
+                    on_change=save_strat_growth_auto
+                )
+                
+                st.caption("💡 Изменения сохраняются автоматически. Прирост перераспределяется только между стратегическими отделами.")
+            else:
+                st.info("Нет стратегических отделов")
         else:
             st.info("Загрузка данных...")
 
@@ -3066,7 +4127,7 @@ if 'Роль' not in df.columns:
 edit_df = df[['Филиал', 'Отдел', 'Месяц', 
               'Выручка_2024', 'Выручка_2025', 'Выручка_2025_Норм',
               'План_Скорр', 'План_Расч', 'План', 'Рекоменд',
-              'Прирост_%', 'Прирост_24_26_%',
+              'Прирост_%', 'Прирост_24_26_%', 'Прирост_Год_%',
               'Сезонность_Факт', 'Сезонность_План',
               'Площадь_2025', 'Площадь_2026', 'Δ_Площадь_%',
               'Отдача_План', 'Отдача_2025', 'Δ_Отдача_%',
@@ -3111,7 +4172,7 @@ all_columns = ['Филиал', 'Отдел', 'Мес', 'Роль', 'Формат
                'Корр', 'Корр±', 'Авто_Корр',
                'План_Скорр', 'План_Расч', 'План', '_План_Расч_Исх', 'Рекоменд',
                'Выручка_2025', 'Выручка_2024', 'Выручка_2025_Норм',
-               'Прирост_%', 'Прирост_24_26_%',
+               'Прирост_%', 'Прирост_24_26_%', 'Прирост_Год_%',
                'Сезонность_Факт', 'Сезонность_План',
                'Площадь_2025', 'Площадь_2026', 'Δ_Площадь_%',
                'Отдача_План', 'Отдача_2025', 'Δ_Отдача_%',
@@ -3381,8 +4442,25 @@ for _, row in edited_df.iterrows():
 if changes_detected:
     new_corrections_list = list(corrections_map.values())
     save_corrections_local(new_corrections_list)
-    st.cache_data.clear()
-    st.rerun()
+    
+    # Debounce: записываем время последнего изменения
+    import time
+    current_time = time.time()
+    st.session_state['last_correction_change'] = current_time
+    
+    # Показываем индикатор ожидания пересчёта
+    placeholder = st.empty()
+    placeholder.info("⏳ Ожидание завершения ввода... (пересчёт через 3 сек)")
+    
+    # Ждём 3 секунды
+    time.sleep(3)
+    
+    # Проверяем, не было ли новых изменений за это время
+    if st.session_state.get('last_correction_change', 0) == current_time:
+        # Новых изменений не было - пересчитываем
+        placeholder.empty()
+        st.cache_data.clear()
+        st.rerun()
 
 # Статистика корректировок (компактно)
 corr_count = (edited_df['Корр'].notna().sum() if 'Корр' in edited_df.columns else 0) + \
