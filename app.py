@@ -10,6 +10,7 @@ import os
 import json
 import warnings
 from datetime import datetime
+import sys
 
 # === ПАРОЛЬ ДЛЯ РЕДАКТИРОВАНИЯ ===
 # Измените этот пароль на свой. Только пользователи, знающие пароль, смогут редактировать данные.
@@ -3432,6 +3433,7 @@ st.sidebar.markdown(f"""
 # Заголовок и дата — ФИЛЬТРЫ ВВЕРХУ
 st.sidebar.header("📊 Фильтры")
 st.sidebar.caption(f"📅 Данные: {st.session_state.get('load_time', 'N/A')}")
+st.sidebar.caption(f"🐍 Python: {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")
 
 # === АВТОРИЗАЦИЯ ДЛЯ РЕДАКТИРОВАНИЯ ===
 if 'edit_authorized' not in st.session_state:
