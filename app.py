@@ -3325,7 +3325,7 @@ if 'splash_shown' not in st.session_state:
         
         # Сначала лошадка — крупно по центру с плавным исчезновением
         horse_placeholder = st.empty()
-        horse_placeholder.image("/home/eveselove/PLANB/horse_icon.png", width=400)
+        horse_placeholder.image(os.path.join(os.path.dirname(__file__), "horse_icon.png"), width=400)
         time.sleep(2.0)  # Показываем дольше
         
         # Плавное исчезновение лошадки
@@ -3347,7 +3347,7 @@ if 'splash_shown' not in st.session_state:
         
         # Потом АКСОН — крупно по центру, дольше с плавным исчезновением
         akson_placeholder = st.empty()
-        akson_placeholder.image("/home/eveselove/PLANB/logo_akson.png", width=400)
+        akson_placeholder.image(os.path.join(os.path.dirname(__file__), "logo_akson.png"), width=400)
         time.sleep(2.5)
         
         # Плавное исчезновение АКСОН
