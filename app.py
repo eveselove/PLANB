@@ -11,6 +11,10 @@ import json
 import warnings
 from datetime import datetime
 
+# === ПАРОЛЬ ДЛЯ РЕДАКТИРОВАНИЯ ===
+# Измените этот пароль на свой. Только пользователи, знающие пароль, смогут редактировать данные.
+EDIT_PASSWORD = "292929"  # <-- ЗАМЕНИТЕ НА СВОЙ ПАРОЛЬ
+
 # Импорт нового оптимизатора распределения
 try:
     from plan_optimizer import distribute_plan_qp, FIXED_DEPARTMENTS, LIMITED_GROWTH_DEPARTMENTS, clear_optimization_cache
@@ -3410,20 +3414,45 @@ if not df_base.empty:
     )
 
 
-# CSS для центрирования заголовка сайдбара
-st.sidebar.markdown("""
+# CSS для центрирования заголовка сайдбара и замены кнопки на лошадку
+horse_b64 = "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"
+
+st.sidebar.markdown(f"""
 <style>
     section[data-testid="stSidebar"] h2,
-    section[data-testid="stSidebar"] .stCaption {
+    section[data-testid="stSidebar"] .stCaption {{
         text-align: center !important;
-    }
+    }}
+    
 </style>
 """, unsafe_allow_html=True)
+
 
 # Заголовок и дата — ФИЛЬТРЫ ВВЕРХУ
 st.sidebar.header("📊 Фильтры")
 st.sidebar.caption(f"📅 Данные: {st.session_state.get('load_time', 'N/A')}")
 
+# === АВТОРИЗАЦИЯ ДЛЯ РЕДАКТИРОВАНИЯ ===
+if 'edit_authorized' not in st.session_state:
+    st.session_state.edit_authorized = False
+
+# Показываем форму авторизации или статус
+if not st.session_state.edit_authorized:
+    with st.sidebar.expander("🔐 Режим редактирования", expanded=False):
+        password_input = st.text_input("Введите пароль:", type="password", key="edit_password_input")
+        if st.button("Войти", key="login_btn", use_container_width=True):
+            if password_input == EDIT_PASSWORD:
+                st.session_state.edit_authorized = True
+                st.rerun()
+            else:
+                st.error("❌ Неверный пароль")
+else:
+    st.sidebar.success("✅ Режим редактирования")
+    if st.sidebar.button("🚪 Выход из редактирования", key="logout_btn", use_container_width=True):
+        st.session_state.edit_authorized = False
+        st.rerun()
+
+st.sidebar.divider()
 
 if df_base.empty:
     st.error("Нет данных для отображения")
@@ -3436,8 +3465,6 @@ all_months = list(range(1, 13))
 
 # Загружаем сохранённые фильтры
 saved_filters = load_filters_local()
-
-st.sidebar.divider()
 
 # Основные фильтры (с учётом сохранённых, по умолчанию пустые = все данные)
 default_branches = saved_filters.get('branches', [])
@@ -4372,203 +4399,189 @@ for col in display_df.columns:
     elif col in ignore_cols: pass
     else: col_config_dynamic[col] = st.column_config.TextColumn(col)
 
-edited_df = st.data_editor(
-    display_df,
-    use_container_width=True,
-    height=600,
-    hide_index=True,
-    disabled=disabled_cols,
-    column_config=col_config_dynamic,
-    key="main_data_editor"
-)
+# Условное отображение: редактирование только для авторизованных
+if st.session_state.get('edit_authorized', False):
+    edited_df = st.data_editor(
+        display_df,
+        use_container_width=True,
+        height=600,
+        hide_index=True,
+        disabled=disabled_cols,
+        column_config=col_config_dynamic,
+        key="main_data_editor"
+    )
+else:
+    # Только просмотр (без редактирования)
+    st.dataframe(
+        display_df,
+        use_container_width=True,
+        height=600,
+        hide_index=True,
+        column_config=col_config_dynamic
+    )
+    edited_df = display_df.copy()  # Пустышка для совместимости с остальным кодом
 
 # --- НАСТРОЙКА (Прирост) --- ML оптимизатор управляет лимитами автоматически
-with st.expander("⚙️ Настройка", expanded=False):
-    tab_growth, tab_strat_growth = st.tabs(["📈 Прирост на год", "🎯 Прирост стратегических"])
-    
-    # === ВКЛАДКА 2: ПРИРОСТ НА ГОД ===
-    with tab_growth:
-        st.caption("Годовой прирост для Сопутствующих отделов. План = Факт 2025 × (1 + Прирост%) × Сезонность. Правило +6% минимум применяется только к Мини/Микро/Интернет.")
+# Только для авторизованных пользователей
+if st.session_state.get('edit_authorized', False):
+    with st.expander("⚙️ Настройка", expanded=False):
+        tab_growth, tab_strat_growth = st.tabs(["📈 Прирост на год", "🎯 Прирост стратегических"])
         
-        # Используем df_base (полный датасет), чтобы настройки не зависели от фильтров
-        target_df = df_base if 'df_base' in locals() and not df_base.empty else df
-        
-        if not target_df.empty:
-            # Показываем ВСЕ филиалы (не только спец-форматы)
-            all_branches = sorted(target_df['Филиал'].unique())
+        # === ВКЛАДКА 1: ПРИРОСТ НА ГОД ===
+        with tab_growth:
+            st.caption("Годовой прирост для Сопутствующих отделов. План = Факт 2025 × (1 + Прирост%) × Сезонность. Правило +6% минимум применяется только к Мини/Микро/Интернет.")
             
-            # Только Сопутствующие отделы
-            if 'Роль' in target_df.columns:
-                accomp_depts = sorted(target_df[target_df['Роль'] == 'Сопутствующий']['Отдел'].unique())
-            else:
-                accomp_depts = sorted(target_df['Отдел'].unique())
+            # Используем df_base (полный датасет), чтобы настройки не зависели от фильтров
+            target_df = df_base if 'df_base' in locals() and not df_base.empty else df
+            
+            if not target_df.empty:
+                # Показываем ВСЕ филиалы (не только спец-форматы)
+                all_branches_growth = sorted(target_df['Филиал'].unique())
                 
-            if len(accomp_depts) > 0:
-                # Загружаем сохраненные приросты
-                growth_file = os.path.join(DATA_DIR, 'growth_rates.json')
-                saved_growth = {}
-                if os.path.exists(growth_file):
-                    try:
-                        with open(growth_file, 'r', encoding='utf-8') as f:
-                            data = json.load(f)
-                            for item in data:
-                                saved_growth[(item['branch'], item['dept'])] = item['rate']
-                    except:
-                        pass
-                
-                # Строим DataFrame для редактора
-                df_growth_ui = pd.DataFrame(index=accomp_depts, columns=all_branches)
-                
-                # Заполняем сохраненные значения
-                for (br, dp), val in saved_growth.items():
-                    if br in all_branches and dp in accomp_depts:
-                        df_growth_ui.at[dp, br] = val
-                
-                # Функция автосохранения при изменении
-                def save_growth_auto():
-                    """Автосохранение приростов при изменении"""
-                    if 'growth_editor_matrix' in st.session_state:
-                        edited_data = st.session_state['growth_editor_matrix']
-                        # Получаем текущий DataFrame из сессии
-                        current_df = df_growth_ui.copy()
-                        
-                        # Применяем изменения из edited_rows
-                        if 'edited_rows' in edited_data:
-                            for row_idx, changes in edited_data['edited_rows'].items():
-                                row_label = current_df.index[int(row_idx)]
-                                for col, val in changes.items():
-                                    current_df.at[row_label, col] = val
-                        
-                        # Собираем данные для сохранения
-                        new_growth_list = []
-                        for dp in current_df.index:
-                            for br in current_df.columns:
-                                val = current_df.at[dp, br]
-                                if pd.notna(val) and str(val).strip() != '':
-                                    try:
-                                        f_val = float(val)
-                                        new_growth_list.append({
-                                            'branch': br,
-                                            'dept': dp,
-                                            'rate': f_val
-                                        })
-                                    except:
-                                        pass
-                        
-                        # Сохраняем
+                # Только Сопутствующие отделы
+                if 'Роль' in target_df.columns:
+                    accomp_depts = sorted(target_df[target_df['Роль'] == 'Сопутствующий']['Отдел'].unique())
+                else:
+                    accomp_depts = sorted(target_df['Отдел'].unique())
+                    
+                if len(accomp_depts) > 0:
+                    # Загружаем сохраненные приросты
+                    growth_file = os.path.join(DATA_DIR, 'growth_rates.json')
+                    saved_growth = {}
+                    if os.path.exists(growth_file):
                         try:
-                            with open(growth_file, 'w', encoding='utf-8') as f:
-                                json.dump(new_growth_list, f, ensure_ascii=False, indent=2)
+                            with open(growth_file, 'r', encoding='utf-8') as f:
+                                data = json.load(f)
+                                for item in data:
+                                    saved_growth[(item['branch'], item['dept'])] = item['rate']
                         except:
                             pass
-                
-                # Редактор прироста с автосохранением
-                edited_growth_df = st.data_editor(
-                    df_growth_ui,
-                    key='growth_editor_matrix',
-                    use_container_width=True,
-                    height=400,
-                    on_change=save_growth_auto
-                )
-                
-                st.caption("💡 Изменения сохраняются автоматически")
-            else:
-                st.info("Нет сопутствующих отделов")
-        else:
-            pass  # Ждём загрузки данных
-    
-    # === ВКЛАДКА 3: ПРИРОСТ СТРАТЕГИЧЕСКИХ ===
-    with tab_strat_growth:
-        st.caption("Годовой прирост для Стратегических отделов. Увеличение прироста одного отдела уменьшает другие пропорционально. Не влияет на ручные корректировки и методику Дверей/Кухонь.")
+                    
+                    # Строим DataFrame для редактора
+                    df_growth_ui = pd.DataFrame(index=accomp_depts, columns=all_branches_growth)
+                    
+                    # Заполняем сохраненные значения
+                    for (br, dp), val in saved_growth.items():
+                        if br in all_branches_growth and dp in accomp_depts:
+                            df_growth_ui.at[dp, br] = val
+                    
+                    # Функция автосохранения при изменении
+                    def save_growth_auto():
+                        """Автосохранение приростов при изменении"""
+                        if 'growth_editor_matrix' in st.session_state:
+                            edited_data = st.session_state['growth_editor_matrix']
+                            current_df = df_growth_ui.copy()
+                            
+                            if 'edited_rows' in edited_data:
+                                for row_idx, changes in edited_data['edited_rows'].items():
+                                    row_label = current_df.index[int(row_idx)]
+                                    for col, val in changes.items():
+                                        current_df.at[row_label, col] = val
+                            
+                            new_growth_list = []
+                            for dp in current_df.index:
+                                for br in current_df.columns:
+                                    val = current_df.at[dp, br]
+                                    if pd.notna(val) and str(val).strip() != '':
+                                        try:
+                                            f_val = float(val)
+                                            new_growth_list.append({'branch': br, 'dept': dp, 'rate': f_val})
+                                        except:
+                                            pass
+                            
+                            try:
+                                with open(growth_file, 'w', encoding='utf-8') as f:
+                                    json.dump(new_growth_list, f, ensure_ascii=False, indent=2)
+                            except:
+                                pass
+                    
+                    # Редактор прироста с автосохранением
+                    edited_growth_df = st.data_editor(
+                        df_growth_ui,
+                        key='growth_editor_matrix',
+                        use_container_width=True,
+                        height=400,
+                        on_change=save_growth_auto
+                    )
+                    
+                    st.caption("💡 Изменения сохраняются автоматически")
+                else:
+                    st.info("Нет сопутствующих отделов")
         
-        # Используем df_base (полный датасет), чтобы настройки не зависели от фильтров
-        target_df = df_base if 'df_base' in locals() and not df_base.empty else df
-        
-        if not target_df.empty:
-            # Показываем ВСЕ филиалы
-            all_branches = sorted(target_df['Филиал'].unique())
+        # === ВКЛАДКА 2: ПРИРОСТ СТРАТЕГИЧЕСКИХ ===
+        with tab_strat_growth:
+            st.caption("Годовой прирост для Стратегических отделов. Увеличение прироста одного отдела уменьшает другие пропорционально. Не влияет на ручные корректировки и методику Дверей/Кухонь.")
             
-            # Только Стратегические отделы (исключаем Двери и Кухни)
-            excluded_depts = ['9. Двери, фурнитура дверная', 'Мебель для кухни']
-            if 'Роль' in target_df.columns:
-                strat_depts = sorted([d for d in target_df[target_df['Роль'] != 'Сопутствующий']['Отдел'].unique() 
-                                     if d not in excluded_depts])
-            else:
-                strat_depts = sorted([d for d in target_df['Отдел'].unique() if d not in excluded_depts])
+            target_df2 = df_base if 'df_base' in locals() and not df_base.empty else df
+            
+            if not target_df2.empty:
+                all_branches_strat = sorted(target_df2['Филиал'].unique())
                 
-            if len(strat_depts) > 0:
-                # Загружаем сохраненные приросты
-                strat_growth_file = os.path.join(DATA_DIR, 'strategic_growth_rates.json')
-                saved_strat_growth = {}
-                if os.path.exists(strat_growth_file):
-                    try:
-                        with open(strat_growth_file, 'r', encoding='utf-8') as f:
-                            data = json.load(f)
-                            for item in data:
-                                saved_strat_growth[(item['branch'], item['dept'])] = item['rate']
-                    except:
-                        pass
-                
-                # Строим DataFrame для редактора
-                df_strat_growth_ui = pd.DataFrame(index=strat_depts, columns=all_branches)
-                
-                # Заполняем сохраненные значения
-                for (br, dp), val in saved_strat_growth.items():
-                    if br in all_branches and dp in strat_depts:
-                        df_strat_growth_ui.at[dp, br] = val
-                
-                # Функция автосохранения при изменении
-                def save_strat_growth_auto():
-                    """Автосохранение приростов стратегических при изменении"""
-                    if 'strat_growth_editor_matrix' in st.session_state:
-                        edited_data = st.session_state['strat_growth_editor_matrix']
-                        # Получаем текущий DataFrame из сессии
-                        current_df = df_strat_growth_ui.copy()
-                        
-                        # Применяем изменения из edited_rows
-                        if 'edited_rows' in edited_data:
-                            for row_idx, changes in edited_data['edited_rows'].items():
-                                row_label = current_df.index[int(row_idx)]
-                                for col, val in changes.items():
-                                    current_df.at[row_label, col] = val
-                        
-                        # Собираем данные для сохранения
-                        new_strat_growth_list = []
-                        for dp in current_df.index:
-                            for br in current_df.columns:
-                                val = current_df.at[dp, br]
-                                if pd.notna(val) and str(val).strip() != '':
-                                    try:
-                                        f_val = float(val)
-                                        new_strat_growth_list.append({
-                                            'branch': br,
-                                            'dept': dp,
-                                            'rate': f_val
-                                        })
-                                    except:
-                                        pass
-                        
-                        # Сохраняем
+                excluded_depts = ['9. Двери, фурнитура дверная', 'Мебель для кухни']
+                if 'Роль' in target_df2.columns:
+                    strat_depts = sorted([d for d in target_df2[target_df2['Роль'] != 'Сопутствующий']['Отдел'].unique() 
+                                         if d not in excluded_depts])
+                else:
+                    strat_depts = sorted([d for d in target_df2['Отдел'].unique() if d not in excluded_depts])
+                    
+                if len(strat_depts) > 0:
+                    strat_growth_file = os.path.join(DATA_DIR, 'strategic_growth_rates.json')
+                    saved_strat_growth = {}
+                    if os.path.exists(strat_growth_file):
                         try:
-                            with open(strat_growth_file, 'w', encoding='utf-8') as f:
-                                json.dump(new_strat_growth_list, f, ensure_ascii=False, indent=2)
+                            with open(strat_growth_file, 'r', encoding='utf-8') as f:
+                                data = json.load(f)
+                                for item in data:
+                                    saved_strat_growth[(item['branch'], item['dept'])] = item['rate']
                         except:
                             pass
-                
-                # Редактор прироста с автосохранением
-                edited_strat_growth_df = st.data_editor(
-                    df_strat_growth_ui,
-                    key='strat_growth_editor_matrix',
-                    use_container_width=True,
-                    height=400,
-                    on_change=save_strat_growth_auto
-                )
-                
-                st.caption("💡 Изменения сохраняются автоматически. Прирост перераспределяется только между стратегическими отделами.")
-            else:
-                st.info("Нет стратегических отделов")
-        else:
-            pass  # Ждём загрузки данных
+                    
+                    df_strat_growth_ui = pd.DataFrame(index=strat_depts, columns=all_branches_strat)
+                    
+                    for (br, dp), val in saved_strat_growth.items():
+                        if br in all_branches_strat and dp in strat_depts:
+                            df_strat_growth_ui.at[dp, br] = val
+                    
+                    def save_strat_growth_auto():
+                        """Автосохранение приростов стратегических при изменении"""
+                        if 'strat_growth_editor_matrix' in st.session_state:
+                            edited_data = st.session_state['strat_growth_editor_matrix']
+                            current_df = df_strat_growth_ui.copy()
+                            
+                            if 'edited_rows' in edited_data:
+                                for row_idx, changes in edited_data['edited_rows'].items():
+                                    row_label = current_df.index[int(row_idx)]
+                                    for col, val in changes.items():
+                                        current_df.at[row_label, col] = val
+                            
+                            new_strat_growth_list = []
+                            for dp in current_df.index:
+                                for br in current_df.columns:
+                                    val = current_df.at[dp, br]
+                                    if pd.notna(val) and str(val).strip() != '':
+                                        try:
+                                            f_val = float(val)
+                                            new_strat_growth_list.append({'branch': br, 'dept': dp, 'rate': f_val})
+                                        except:
+                                            pass
+                            
+                            try:
+                                with open(strat_growth_file, 'w', encoding='utf-8') as f:
+                                    json.dump(new_strat_growth_list, f, ensure_ascii=False, indent=2)
+                            except:
+                                pass
+                    
+                    edited_strat_growth_df = st.data_editor(
+                        df_strat_growth_ui,
+                        key='strat_growth_editor_matrix',
+                        use_container_width=True,
+                        height=400,
+                        on_change=save_strat_growth_auto
+                    )
+                    
+                    st.caption("💡 Изменения сохраняются автоматически. Прирост перераспределяется только между стратегическими отделами.")
+                else:
+                    st.info("Нет стратегических отделов")
     
 # Для логики сохранения нам нужно добавить в edited_df недостающие колонки (месяц числом), 
 # чтобы логика внизу (iterrows) работала корректно.
@@ -4684,3 +4697,4 @@ corr_count = (edited_df['Корр'].notna().sum() if 'Корр' in edited_df.col
              (edited_df['Корр±'].notna().sum() if 'Корр±' in edited_df.columns else 0)
 if corr_count > 0:
     st.caption(f"✏️ Корректировок: {corr_count}")
+
