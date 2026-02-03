@@ -1,0 +1,14 @@
+{
+    "weight_momentum": 70,
+    "weight_penetration": 30,
+    "inflation_floor": 6,
+    "hard_limit": 80,
+    "driver_min": 6,
+    "driver_max": 30,
+    "buffer_min": -10,
+    "buffer_max": 12,
+    "role_mult_strategic": 1.1,
+    "role_mult_accompanying": 1.0,
+    "bonus_divisor": 2,
+    "bonus_max": 10
+}

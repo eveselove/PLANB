@@ -11,15 +11,47 @@ import json
 import warnings
 from datetime import datetime
 
+# Импорт нового оптимизатора распределения
+try:
+    from plan_optimizer import distribute_plan_qp, FIXED_DEPARTMENTS, LIMITED_GROWTH_DEPARTMENTS, clear_optimization_cache
+    USE_QP_OPTIMIZER = True
+except ImportError:
+    USE_QP_OPTIMIZER = False
+    def clear_optimization_cache(): pass  # Заглушка
+
 warnings.filterwarnings('ignore')
 
-st.set_page_config(page_title="План 2026", page_icon="📊", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="План 2026", page_icon="📊", layout="wide", initial_sidebar_state="collapsed")
 
-# Убираем лишние отступы Streamlit
+# Убираем лишние отступы Streamlit и фиксируем масштабирование колонок
 st.markdown("""
 <style>
-    .block-container {padding-top: 1rem; padding-bottom: 0rem;}
+    .block-container {
+        padding-top: 0.5rem; 
+        padding-bottom: 0rem;
+        padding-left: 0.5rem;
+        padding-right: 0.5rem;
+    }
     div[data-testid="stVerticalBlock"] > div {gap: 0.3rem;}
+    
+    /* Фиксируем 4 колонки графиков */
+    div[data-testid="stHorizontalBlock"] {
+        flex-wrap: nowrap !important;
+        overflow-x: auto;
+    }
+    div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"] {
+        min-width: 200px;
+        flex: 1 1 25%;
+    }
+    
+    /* Уменьшаем размер шрифта в таблицах */
+    div[data-testid="stDataFrame"] {
+        font-size: 11px !important;
+    }
+    div[data-testid="stDataFrame"] td, div[data-testid="stDataFrame"] th {
+        padding: 2px 4px !important;
+        font-size: 10px !important;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -1940,7 +1972,7 @@ def calculate_plan(df_sales, corrections=None, role_coefficients=None, limits=No
         'penetration': 0.6,  # 60% - "Сколько еще места на рынке?"
         'momentum': 0.4      # 40% - "Как быстро бежим?"
     }
-    INFLATION_FLOOR = 0.06
+    INFLATION_FLOOR = 0.0  # Пол убран — базовый план = факт 2025
     ROUND_STEP = ROUNDING_STEP  # 10000
     
     # S-кривая для нормализации
@@ -2074,7 +2106,36 @@ def calculate_plan(df_sales, corrections=None, role_coefficients=None, limits=No
                     result.loc[max_idx, 'План_Расч'] += final_residual
             continue
         
-        # ========== SMART BALANCING v2 ДЛЯ ОБЫЧНЫХ ФОРМАТОВ ==========
+        # ========== КВАДРАТИЧНОЕ ПРОГРАММИРОВАНИЕ (НОВЫЙ ОПТИМИЗАТОР) ==========
+        if USE_QP_OPTIMIZER:
+            # Собираем фиксированные планы:
+            # 1. Двери, Кухни и др. из FIXED_DEPARTMENTS
+            # 2. Ручные корректировки (Корр)
+            fixed_plans = {}
+            for i in idx:
+                dept = result.loc[i, 'Отдел']
+                
+                # Фиксированные отделы (Двери, Кухни, etc.)
+                if any(fix in str(dept) for fix in FIXED_DEPARTMENTS):
+                    if pd.notna(result.loc[i, 'План_Расч']) and result.loc[i, 'План_Расч'] > 0:
+                        fixed_plans[dept] = result.loc[i, 'План_Расч']
+                
+                # Ручные корректировки (Корр)
+                if 'Корр' in result.columns and pd.notna(result.loc[i, 'Корр']):
+                    corr_val = result.loc[i, 'Корр']
+                    if 'Корр_Дельта' in result.columns and pd.notna(result.loc[i, 'Корр_Дельта']):
+                        corr_val += result.loc[i, 'Корр_Дельта']
+                    fixed_plans[dept] = corr_val
+            
+            # Вызываем QP оптимизатор
+            branch_data = result.loc[idx].copy()
+            optimized = distribute_plan_qp(branch_data, target, fixed_plans)
+            
+            # Обновляем результаты
+            result.loc[idx, 'План_Расч'] = optimized['План_Расч'].values
+            continue
+        
+        # ========== SMART BALANCING v2 ДЛЯ ОБЫЧНЫХ ФОРМАТОВ (LEGACY) ==========
         
         # 2. ФИКСИРОВАННЫЕ (Неприкасаемые)
         is_manual = has_correction(group_slice)
@@ -2156,21 +2217,42 @@ def calculate_plan(df_sales, corrections=None, role_coefficients=None, limits=No
             else:
                 final_plans = base_floor
         else:
-            # === ДЕФИЦИТ (CUT) ===
-            max_score = scores.max() + 0.1
-            weakness = max_score - scores
+            # === ДЕФИЦИТ (CUT) — РЕЖЕМ ТОЛЬКО СОПУТСТВУЮЩИХ ===
+            # Стратегические сохраняют свой пол
             
-            cut_weights = result.loc[active_idx, rev_col_active] * (weakness ** 2)
-            
-            if cut_weights.sum() > 0:
-                share = cut_weights / cut_weights.sum()
-                final_plans = base_floor + (delta * share)
+            if 'Роль' in result.columns:
+                # Разделяем на стратегических и сопутствующих
+                strat_active = active_idx[result.loc[active_idx, 'Роль'] != 'Сопутствующий']
+                acc_active = active_idx[result.loc[active_idx, 'Роль'] == 'Сопутствующий']
+                
+                # Стратегические получают свой пол (base_floor)
+                final_plans = base_floor.copy()
+                
+                # Пересчитываем дельту только для сопутствующих
+                strat_floor_sum = base_floor.loc[strat_active].sum() if len(strat_active) > 0 else 0
+                acc_target = residual_target - strat_floor_sum
+                acc_floor_sum = base_floor.loc[acc_active].sum() if len(acc_active) > 0 else 0
+                
+                if len(acc_active) > 0 and acc_floor_sum > 0:
+                    # Режем только сопутствующих пропорционально
+                    if acc_target >= acc_floor_sum:
+                        # Хватает денег — даём пол
+                        pass  # final_plans уже = base_floor
+                    else:
+                        # Дефицит — режем сопутствующих пропорционально
+                        acc_ratio = acc_target / acc_floor_sum if acc_floor_sum > 0 else 0
+                        final_plans.loc[acc_active] = base_floor.loc[acc_active] * max(0, acc_ratio)
             else:
-                ratio = residual_target / total_floor if total_floor > 0 else 0
-                final_plans = base_floor * ratio
-            
-            # Hard stop: не ниже 80% от факта 2025
-            final_plans = final_plans.clip(lower=result.loc[active_idx, rev_col_active] * 0.8)
+                # Нет колонки Роль — старая логика
+                max_score = scores.max() + 0.1
+                weakness = max_score - scores
+                cut_weights = result.loc[active_idx, rev_col_active] * (weakness ** 2)
+                if cut_weights.sum() > 0:
+                    share = cut_weights / cut_weights.sum()
+                    final_plans = base_floor + (delta * share)
+                else:
+                    ratio = residual_target / total_floor if total_floor > 0 else 0
+                    final_plans = base_floor * ratio
         
         # ОГРАНИЧЕНИЕ: Обои — не более +8% прироста и не ниже 0%
         MAX_GROWTH_LIMITED = 0.08
@@ -3200,8 +3282,138 @@ st.markdown('''
 # Данные загружаются ОДИН РАЗ при входе и используются всю сессию
 # При перезагрузке страницы (F5) — данные загружаются заново
 
+# Показываем заставку ТОЛЬКО при первом визите в сессию
+if 'splash_shown' not in st.session_state:
+    import time
+    
+    # Полноэкранный белый фон с центрированием
+    splash = st.empty()
+    
+    # CSS для кнопки сайдбара — загружаем СРАЗУ чтобы не было синего артефакта
+    horse_b64_splash = "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"
+    
+    st.markdown(f"""
+    <style>
+        /* Кнопка сайдбара — круглая FAB стиль Material Design */
+        button[data-testid="stBaseButton-headerNoPadding"],
+        button[kind="headerNoPadding"] {{
+            background-color: white !important;
+            background-image: url('data:image/png;base64,{horse_b64_splash}') !important;
+            background-repeat: no-repeat !important;
+            background-position: center center !important;
+            background-size: 40px 40px !important;
+            width: 56px !important;
+            height: 56px !important;
+            border: 2px solid #e8e8e8 !important;
+            border-radius: 50% !important;
+            box-shadow: 0 3px 5px -1px rgba(0,0,0,0.2), 0 6px 10px 0 rgba(0,0,0,0.14), 0 1px 18px 0 rgba(0,0,0,0.12) !important;
+            overflow: hidden !important;
+            position: relative !important;
+            transition: box-shadow 0.28s cubic-bezier(0.4, 0, 0.2, 1) !important;
+        }}
+        button[data-testid="stBaseButton-headerNoPadding"] *,
+        button[kind="headerNoPadding"] * {{
+            display: none !important;
+            visibility: hidden !important;
+        }}
+        button[data-testid="stBaseButton-headerNoPadding"]::before,
+        button[kind="headerNoPadding"]::before {{
+            content: "" !important;
+            position: absolute !important;
+            top: 0 !important;
+            left: 0 !important;
+            right: 0 !important;
+            bottom: 0 !important;
+            background: white url('data:image/png;base64,{horse_b64_splash}') no-repeat center center !important;
+            background-size: 40px 40px !important;
+            border-radius: 50% !important;
+            z-index: 9999 !important;
+        }}
+        button[data-testid="stBaseButton-headerNoPadding"]:hover,
+        button[kind="headerNoPadding"]:hover {{
+            box-shadow: 0 5px 5px -3px rgba(0,0,0,0.2), 0 8px 10px 1px rgba(0,0,0,0.14), 0 3px 14px 2px rgba(0,0,0,0.12) !important;
+        }}
+    </style>
+    """, unsafe_allow_html=True)
+    
+    with splash.container():
+        st.markdown("""
+        <style>
+            .stApp { background: white !important; }
+            .stApp > header, .stSidebar, footer, div[data-testid="stSidebarNav"] { 
+                visibility: hidden !important; 
+                display: none !important;
+            }
+            div[data-testid="stVerticalBlock"] {
+                display: flex;
+                flex-direction: column;
+                justify-content: center;
+                align-items: center;
+                min-height: 100vh;
+            }
+            @keyframes zoomIn {
+                0% { opacity: 0; transform: scale(0.3); }
+                50% { opacity: 1; transform: scale(1.05); }
+                100% { opacity: 1; transform: scale(1); }
+            }
+            div[data-testid="stImage"] img {
+                animation: zoomIn 0.6s ease-out;
+            }
+        </style>
+        """, unsafe_allow_html=True)
+        
+        # Задержка перед появлением лошадки
+        time.sleep(1.0)
+        
+        # Сначала лошадка — крупно по центру с плавным исчезновением
+        horse_placeholder = st.empty()
+        horse_placeholder.image("/home/eveselove/PLANB/horse_icon.png", width=400)
+        time.sleep(2.0)  # Показываем дольше
+        
+        # Плавное исчезновение лошадки
+        fade_style = st.empty()
+        fade_style.markdown("""
+        <style>
+            div[data-testid="stImage"] img {
+                animation: fadeOut 0.8s ease-out forwards !important;
+            }
+            @keyframes fadeOut {
+                0% { opacity: 1; transform: scale(1); }
+                100% { opacity: 0; transform: scale(0.95); }
+            }
+        </style>
+        """, unsafe_allow_html=True)
+        time.sleep(0.8)
+        horse_placeholder.empty()
+        fade_style.empty()
+        
+        # Потом АКСОН — крупно по центру, дольше с плавным исчезновением
+        akson_placeholder = st.empty()
+        akson_placeholder.image("/home/eveselove/PLANB/logo_akson.png", width=400)
+        time.sleep(2.5)
+        
+        # Плавное исчезновение АКСОН
+        fade_style2 = st.empty()
+        fade_style2.markdown("""
+        <style>
+            div[data-testid="stImage"] img {
+                animation: fadeOut 0.8s ease-out forwards !important;
+            }
+            @keyframes fadeOut {
+                0% { opacity: 1; transform: scale(1); }
+                100% { opacity: 0; transform: scale(0.95); }
+            }
+        </style>
+        """, unsafe_allow_html=True)
+        time.sleep(0.8)
+        akson_placeholder.empty()
+        fade_style2.empty()
+    
+    splash.empty()
+    st.session_state['splash_shown'] = True
+
 if 'data_loaded' not in st.session_state:
-    with st.spinner("📊 Загрузка данных из Google Sheets..."):
+    with st.spinner("📊 Загрузка данных..."):
         st.session_state['raw_sales'] = load_raw_data()
         st.session_state['rules'] = load_rules()
         st.session_state['roles'] = load_roles()
@@ -3210,90 +3422,85 @@ if 'data_loaded' not in st.session_state:
         st.session_state['data_loaded'] = True
         st.session_state['load_time'] = pd.Timestamp.now().strftime('%H:%M:%S')
 
-# Сайдбар - Кнопки управления
-col_refresh, col_restart = st.sidebar.columns(2)
 
-with col_refresh:
-    if st.button("🔄 Обновить", type="primary", use_container_width=True):
-        for key in ['data_loaded', 'raw_sales', 'rules', 'roles', 'branch_plans', 'areas']:
-            if key in st.session_state:
-                del st.session_state[key]
-        st.cache_data.clear()
-        st.rerun()
 
-with col_restart:
-    if st.button("🔧 Перезапуск", type="secondary", use_container_width=True, help="Полный сброс: очищает ВСЕ кэши и перезагружает код"):
-        # Полная очистка всех кэшей
-        st.cache_data.clear()
-        st.cache_resource.clear()
-        # Очистка session state полностью
-        for key in list(st.session_state.keys()):
-            del st.session_state[key]
-        # Перезапуск
-        st.rerun()
+# Сайдбар - Кнопка обновления
+if st.sidebar.button("🔄 Обновить данные", type="primary", use_container_width=True):
+    # Полная очистка всех кэшей
+    st.cache_data.clear()
+    clear_optimization_cache()  # Очищаем кэш ML оптимизатора
+    for key in list(st.session_state.keys()):
+        del st.session_state[key]
+    st.rerun()
 
-# Редактор лимитов перенесен в основную часть страницы (под графики)
-pass
-
-# Заголовок и дата
-st.sidebar.header("📊 Фильтры")
-st.sidebar.caption(f"📅 Данные: {st.session_state.get('load_time', 'N/A')}")
-
-# ========== КОМПРЕССОР (Коэффициенты нагрузки) ==========
-with st.sidebar.expander("⚖️ Компрессор (K нагрузки)", expanded=False):
-    st.caption("Коэффициенты перераспределения нагрузки по ролям")
-    st.caption("1.0 = без изменений, >1 = больше, <1 = меньше")
-    
-    # Загружаем сохранённые настройки компрессора
-    saved_compressor = load_compressor_local()
-    
-    # Роли и их дефолтные коэффициенты
-    ROLE_DEFAULTS = {
-        'Краски': 1.0,
-        'Обои': 1.0,
-        'Стратегический': 1.0,
-        'Сопутствующий': 1.0
-    }
-    
-    role_coefficients = {}
-    for role, default_val in ROLE_DEFAULTS.items():
-        # Ищем сохранённое значение по роли
-        saved_val = 1.0
-        for key, vals in saved_compressor.items():
-            if key == role or (isinstance(key, tuple) and key[1] == role):
-                saved_val = vals.get('growth', 1.0)
-                break
-        
-        coef = st.slider(
-            f"K: {role}", 
-            min_value=0.5, 
-            max_value=1.5, 
-            value=saved_val, 
-            step=0.05,
-            key=f"comp_{role}"
-        )
-        if coef != 1.0:
-            role_coefficients[role] = coef
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("💾 Сохранить", key="save_comp"):
-            # Сохраняем коэффициенты
-            comp_to_save = {role: {'growth': role_coefficients.get(role, 1.0), 'decline': 1.0} 
-                          for role in ROLE_DEFAULTS.keys()}
-            if save_compressor_local(comp_to_save):
-                st.success("✓")
-    with col2:
-        if st.button("🔄 Сброс", key="reset_comp"):
-            # Удаляем файл компрессора
-            import os
-            filepath = os.path.join(DATA_DIR, 'compressor.json')
-            if os.path.exists(filepath):
-                os.remove(filepath)
-                st.rerun()
+# ========== КОМПРЕССОР ОТКЛЮЧЁН — ML ОПТИМИЗАТОР УПРАВЛЯЕТ АВТОМАТИЧЕСКИ ==========
+role_coefficients = None
 
 # Загрузка данных с учётом корректировок и расчётом плана
-df_base = get_plan_data(role_coefficients=role_coefficients if role_coefficients else None)
+df_base = get_plan_data(role_coefficients=role_coefficients)
+
+# Сайдбар - Кнопка скачивания плана
+def prepare_plan_csv(dataframe):
+    """Подготовка CSV с планом"""
+    export_df = dataframe[['Филиал', 'Отдел', 'Месяц', 'План_Скорр']].copy()
+    export_df = export_df.rename(columns={'План_Скорр': 'План'})
+    export_df['Месяц'] = export_df['Месяц'].map(MONTH_MAP_REV)
+    return export_df.to_csv(index=False).encode('utf-8')
+
+if not df_base.empty:
+    # CSS для замены кнопки сайдбара на изображение лошадки
+    horse_b64 = "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"
+    
+    st.sidebar.markdown(f"""
+    <style>
+        /* Заменяем кнопку сайдбара на изображение лошадки — полностью непрозрачная */
+        button[data-testid="stBaseButton-headerNoPadding"],
+        button[kind="headerNoPadding"] {{
+            background-color: white !important;
+            background-image: url('data:image/png;base64,{horse_b64}') !important;
+            background-repeat: no-repeat !important;
+            background-position: center center !important;
+            background-size: 50px 50px !important;
+            width: 60px !important;
+            height: 60px !important;
+            border: 1px solid #e0e0e0 !important;
+            border-radius: 12px !important;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1) !important;
+            overflow: hidden !important;
+            position: relative !important;
+        }}
+        /* Скрываем SVG стрелки полностью */
+        button[data-testid="stBaseButton-headerNoPadding"] svg,
+        button[kind="headerNoPadding"] svg {{
+            display: none !important;
+            visibility: hidden !important;
+            opacity: 0 !important;
+        }}
+        /* Белый слой поверх всего внутри кнопки */
+        button[data-testid="stBaseButton-headerNoPadding"]::before,
+        button[kind="headerNoPadding"]::before {{
+            content: "" !important;
+            position: absolute !important;
+            top: 0 !important;
+            left: 0 !important;
+            right: 0 !important;
+            bottom: 0 !important;
+            background: white url('data:image/png;base64,{horse_b64}') no-repeat center center !important;
+            background-size: 50px 50px !important;
+            border-radius: 12px !important;
+            z-index: 999 !important;
+        }}
+        button[data-testid="stBaseButton-headerNoPadding"]:hover,
+        button[kind="headerNoPadding"]:hover {{
+            box-shadow: 0 6px 16px rgba(0,0,0,0.15) !important;
+            border-color: #ccc !important;
+        }}
+    </style>
+    """, unsafe_allow_html=True)
+
+# Заголовок и дата — ФИЛЬТРЫ ВВЕРХУ
+st.sidebar.header("📊 Фильтры")
+st.sidebar.caption(f"📅 Данные: {st.session_state.get('load_time', 'N/A')}")
 
 
 if df_base.empty:
@@ -3330,10 +3537,6 @@ sel_months = st.sidebar.multiselect("Месяц", all_months, default=default_mo
 st.sidebar.divider()
 
 
-# Выбор колонок для таблицы
-# Выбор колонок для таблицы
-# Выбор колонок для таблицы
-st.sidebar.header("📋 Колонки таблицы")
 # Выбор колонок для таблицы
 st.sidebar.header("📋 Колонки таблицы")
 
@@ -3384,7 +3587,7 @@ sel_columns = [c for c in all_columns_full if c in MANDATORY_COLS or c in sel_op
 
 
 # Обновляем кнопку сохранения, чтобы сохранять и колонки
-if st.sidebar.button("💾 Сохранить настройки"):
+if st.sidebar.button("💾 Сохранить настройки", use_container_width=True):
     # Сохраняем только опциональные колонки (не обязательные)
     filters_to_save = {
         'branches': sel_branches,
@@ -3394,7 +3597,6 @@ if st.sidebar.button("💾 Сохранить настройки"):
     }
     if save_filters_local(filters_to_save):
         st.sidebar.success("Настройки (фильтры и столбцы) сохранены!")
-
 
 
 # Все линии на графиках всегда показываем
@@ -3418,11 +3620,53 @@ if sel_months:
 # Убираем отступы вверху страницы
 st.markdown("""
 <style>
-    .block-container {padding-top: 1rem !important; padding-bottom: 0 !important;}
-    header {visibility: hidden;}
+    .block-container {
+        padding-top: 0.3rem !important; 
+        padding-bottom: 0 !important; 
+        margin-top: 0 !important;
+        padding-left: 1rem !important;
+        padding-right: 1rem !important;
+    }
+    header {visibility: hidden; height: 0 !important;}
     .stApp > header {display: none;}
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    
+    /* Минимальные отступы между элементами */
+    div[data-testid="stVerticalBlock"] > div {
+        gap: 0.1rem !important;
+    }
+    
+    /* Выравнивание колонок заголовка по центру */
+    div[data-testid="stHorizontalBlock"] {
+        align-items: center !important;
+        gap: 0 !important;
+    }
+    
+    /* Убираем скругление у всех изображений */
+    div[data-testid="stImage"] img {
+        border-radius: 0 !important;
+    }
+    
+    /* Центрирование заголовков над графиками */
+    .stCaption p {
+        text-align: center !important;
+        font-weight: 600 !important;
+    }
+    
+    /* Уменьшение отступов между панелью и графиками */
+    div[data-testid="stExpander"] {
+        margin-bottom: 0.2rem !important;
+    }
 </style>
 """, unsafe_allow_html=True)
+
+# Компактный заголовок в одну линию — АКСОН и План
+col_logo, col_title = st.columns([1, 4])
+with col_logo:
+    st.image("logo_akson.png", width=140)
+with col_title:
+    st.markdown("<p style='margin: 0; padding: 10px 0; font-size: 32px; font-weight: 600; color: #333;'>План</p>", unsafe_allow_html=True)
 
 # KPI (компактная строка)
 total_plan = df['План_Скорр'].sum()
@@ -3614,21 +3858,21 @@ with col1:
                 x=row['M'], y=y_min,
                 text=f"<b>{val:+.0f}%</b>",
                 showarrow=False,
-                font=dict(size=14, color=color),
+                font=dict(size=10, color=color),
                 bgcolor='rgba(255,255,255,0.85)',
-                borderpad=2
+                borderpad=1
             ))
         fig1.update_layout(annotations=annotations)
     
     fig1.update_layout(
-        margin=dict(l=0,r=0,t=10,b=30), height=320, 
+        margin=dict(l=0,r=0,t=10,b=20), height=280, 
         showlegend=True, 
-        legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="left", x=0, font=dict(size=14)),
-        hoverlabel=dict(bgcolor='white', font_size=16),
+        legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="left", x=0, font=dict(size=10)),
+        hoverlabel=dict(bgcolor='white', font_size=12),
         hovermode='x'
     )
-    fig1.update_xaxes(tickfont=dict(size=14), tickangle=0)
-    fig1.update_yaxes(tickfont=dict(size=14), showticklabels=False)
+    fig1.update_xaxes(tickfont=dict(size=8), tickangle=0)
+    fig1.update_yaxes(tickfont=dict(size=8), showticklabels=False)
     st.plotly_chart(fig1, use_container_width=True)
 
 # 2. Таблица по отделам (числа прироста)
@@ -3753,14 +3997,14 @@ with col2:
         hovertext=hover_texts,
         hoverinfo='text'
     ))
-    # Динамическая высота (не более 320px)
-    row_height = 30
+    # Динамическая высота (не более 280px)
+    row_height = 25
     min_height = 100
-    calc_height = min(320, max(min_height, len(pivot) * row_height + 50))
+    calc_height = min(280, max(min_height, len(pivot) * row_height + 40))
     
-    fig_h1.update_layout(margin=dict(l=0,r=0,t=10,b=30), height=calc_height, hoverlabel=dict(bgcolor='white', font_size=16))
-    fig_h1.update_xaxes(tickfont=dict(size=14), side='bottom')
-    fig_h1.update_yaxes(tickfont=dict(size=10), autorange='reversed')
+    fig_h1.update_layout(margin=dict(l=0,r=0,t=10,b=20), height=calc_height, hoverlabel=dict(bgcolor='white', font_size=12))
+    fig_h1.update_xaxes(tickfont=dict(size=9), side='bottom', tickangle=0)
+    fig_h1.update_yaxes(tickfont=dict(size=8), autorange='reversed')
     st.plotly_chart(fig_h1, use_container_width=True)
 
 # 3. Таблица по филиалам (числа прироста)
@@ -3881,12 +4125,12 @@ with col3:
         hovertemplate='%{hovertext}<extra></extra>'
     ))
     
-    # Динамическая высота для филиалов (не более 320px)
-    calc_height_br = min(320, max(100, len(pivot_br) * 30 + 50))
+    # Динамическая высота для филиалов (не более 280px)
+    calc_height_br = min(280, max(100, len(pivot_br) * 25 + 40))
     
-    fig_h2.update_layout(margin=dict(l=0,r=0,t=10,b=30), height=calc_height_br, hoverlabel=dict(bgcolor='white', font_size=16))
-    fig_h2.update_xaxes(tickfont=dict(size=14), side='bottom')
-    fig_h2.update_yaxes(tickfont=dict(size=10), autorange='reversed')
+    fig_h2.update_layout(margin=dict(l=0,r=0,t=10,b=20), height=calc_height_br, hoverlabel=dict(bgcolor='white', font_size=12))
+    fig_h2.update_xaxes(tickfont=dict(size=9), side='bottom', tickangle=0)
+    fig_h2.update_yaxes(tickfont=dict(size=8), autorange='reversed')
     st.plotly_chart(fig_h2, use_container_width=True)
 
 # 4. График сезонности
@@ -3985,267 +4229,15 @@ with col4:
     ))
     
     fig4.update_layout(
-        margin=dict(l=0,r=0,t=10,b=30), height=320, 
+        margin=dict(l=0,r=0,t=10,b=20), height=280, 
         showlegend=True, 
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0, font=dict(size=16)),
-        hoverlabel=dict(bgcolor='white', font_size=16),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0, font=dict(size=8)),
+        hoverlabel=dict(bgcolor='white', font_size=10),
         hovermode='x'
     )
-    fig4.update_xaxes(tickfont=dict(size=14), tickangle=0)
-    fig4.update_yaxes(tickfont=dict(size=14), ticksuffix="%")
+    fig4.update_xaxes(tickfont=dict(size=8), tickangle=0)
+    fig4.update_yaxes(tickfont=dict(size=8), ticksuffix="%")
     st.plotly_chart(fig4, use_container_width=True)
-
-# --- НАСТРОЙКА (Лимиты и Прирост) ---
-with st.expander("⚙️ Настройка", expanded=False):
-    tab_limits, tab_growth, tab_strat_growth = st.tabs(["📊 Лимиты роста", "📈 Прирост на год", "🎯 Прирост стратегических"])
-    
-    # === ВКЛАДКА 1: ЛИМИТЫ РОСТА ===
-    with tab_limits:
-        st.caption("Оставьте ячейку пустой для снятия лимита. Введенное значение (например 5) означает лимит +5% к 2025 году.")
-        
-        # Загружаем текущие сохраненные лимиты
-        current_limits = load_limits_local()
-        
-        if 'raw_sales' in st.session_state:
-            df_raw = st.session_state['raw_sales']
-            if not df_raw.empty:
-                all_branches = sorted(df_raw['Филиал'].unique())
-                all_depts = sorted(df_raw['Отдел'].unique())
-                
-                # Строим исходный DF для отображения
-                df_lim_ui = pd.DataFrame(index=all_depts, columns=all_branches)
-                
-                # Заполняем
-                for (br, dp), val in current_limits.items():
-                    if br in all_branches and dp in all_depts:
-                        df_lim_ui.at[dp, br] = val
-                
-                # Функция автосохранения при изменении
-                def save_limits_auto():
-                    """Автосохранение лимитов при изменении"""
-                    if 'limits_editor_matrix_main' in st.session_state:
-                        edited_data = st.session_state['limits_editor_matrix_main']
-                        # Получаем текущий DataFrame из сессии
-                        current_df = df_lim_ui.copy()
-                        
-                        # Применяем изменения из edited_rows
-                        if 'edited_rows' in edited_data:
-                            for row_idx, changes in edited_data['edited_rows'].items():
-                                row_label = current_df.index[int(row_idx)]
-                                for col, val in changes.items():
-                                    current_df.at[row_label, col] = val
-                        
-                        # Собираем данные для сохранения
-                        new_limits_dict = {}
-                        for dp in current_df.index:
-                            for br in current_df.columns:
-                                val = current_df.at[dp, br]
-                                if pd.notna(val) and str(val).strip() != '':
-                                    try:
-                                        f_val = float(val)
-                                        new_limits_dict[(br, dp)] = f_val
-                                    except:
-                                        pass
-                        
-                        # Сохраняем
-                        save_limits_local(new_limits_dict)
-                
-                # Редактор с автосохранением
-                edited_limits_df = st.data_editor(
-                    df_lim_ui,
-                    key='limits_editor_matrix_main',
-                    use_container_width=True,
-                    height=400,
-                    on_change=save_limits_auto
-                )
-                
-                st.caption("💡 Изменения сохраняются автоматически")
-        else:
-            st.info("Загрузка данных...")
-    
-    # === ВКЛАДКА 2: ПРИРОСТ НА ГОД ===
-    with tab_growth:
-        st.caption("Годовой прирост для Сопутствующих отделов. План = Факт 2025 × (1 + Прирост%) × Сезонность. Правило +6% минимум применяется только к Мини/Микро/Интернет.")
-        
-        # Используем df_base (полный датасет), чтобы настройки не зависели от фильтров
-        target_df = df_base if 'df_base' in locals() and not df_base.empty else df
-        
-        if not target_df.empty:
-            # Показываем ВСЕ филиалы (не только спец-форматы)
-            all_branches = sorted(target_df['Филиал'].unique())
-            
-            # Только Сопутствующие отделы
-            if 'Роль' in target_df.columns:
-                accomp_depts = sorted(target_df[target_df['Роль'] == 'Сопутствующий']['Отдел'].unique())
-            else:
-                accomp_depts = sorted(target_df['Отдел'].unique())
-                
-            if len(accomp_depts) > 0:
-                # Загружаем сохраненные приросты
-                growth_file = os.path.join(DATA_DIR, 'growth_rates.json')
-                saved_growth = {}
-                if os.path.exists(growth_file):
-                    try:
-                        with open(growth_file, 'r', encoding='utf-8') as f:
-                            data = json.load(f)
-                            for item in data:
-                                saved_growth[(item['branch'], item['dept'])] = item['rate']
-                    except:
-                        pass
-                
-                # Строим DataFrame для редактора
-                df_growth_ui = pd.DataFrame(index=accomp_depts, columns=all_branches)
-                
-                # Заполняем сохраненные значения
-                for (br, dp), val in saved_growth.items():
-                    if br in all_branches and dp in accomp_depts:
-                        df_growth_ui.at[dp, br] = val
-                
-                # Функция автосохранения при изменении
-                def save_growth_auto():
-                    """Автосохранение приростов при изменении"""
-                    if 'growth_editor_matrix' in st.session_state:
-                        edited_data = st.session_state['growth_editor_matrix']
-                        # Получаем текущий DataFrame из сессии
-                        current_df = df_growth_ui.copy()
-                        
-                        # Применяем изменения из edited_rows
-                        if 'edited_rows' in edited_data:
-                            for row_idx, changes in edited_data['edited_rows'].items():
-                                row_label = current_df.index[int(row_idx)]
-                                for col, val in changes.items():
-                                    current_df.at[row_label, col] = val
-                        
-                        # Собираем данные для сохранения
-                        new_growth_list = []
-                        for dp in current_df.index:
-                            for br in current_df.columns:
-                                val = current_df.at[dp, br]
-                                if pd.notna(val) and str(val).strip() != '':
-                                    try:
-                                        f_val = float(val)
-                                        new_growth_list.append({
-                                            'branch': br,
-                                            'dept': dp,
-                                            'rate': f_val
-                                        })
-                                    except:
-                                        pass
-                        
-                        # Сохраняем
-                        try:
-                            with open(growth_file, 'w', encoding='utf-8') as f:
-                                json.dump(new_growth_list, f, ensure_ascii=False, indent=2)
-                        except:
-                            pass
-                
-                # Редактор прироста с автосохранением
-                edited_growth_df = st.data_editor(
-                    df_growth_ui,
-                    key='growth_editor_matrix',
-                    use_container_width=True,
-                    height=400,
-                    on_change=save_growth_auto
-                )
-                
-                st.caption("💡 Изменения сохраняются автоматически")
-            else:
-                st.info("Нет сопутствующих отделов")
-        else:
-            st.info("Загрузка данных...")
-    
-    # === ВКЛАДКА 3: ПРИРОСТ СТРАТЕГИЧЕСКИХ ===
-    with tab_strat_growth:
-        st.caption("Годовой прирост для Стратегических отделов. Увеличение прироста одного отдела уменьшает другие пропорционально. Не влияет на ручные корректировки и методику Дверей/Кухонь.")
-        
-        # Используем df_base (полный датасет), чтобы настройки не зависели от фильтров
-        target_df = df_base if 'df_base' in locals() and not df_base.empty else df
-        
-        if not target_df.empty:
-            # Показываем ВСЕ филиалы
-            all_branches = sorted(target_df['Филиал'].unique())
-            
-            # Только Стратегические отделы (исключаем Двери и Кухни)
-            excluded_depts = ['9. Двери, фурнитура дверная', 'Мебель для кухни']
-            if 'Роль' in target_df.columns:
-                strat_depts = sorted([d for d in target_df[target_df['Роль'] != 'Сопутствующий']['Отдел'].unique() 
-                                     if d not in excluded_depts])
-            else:
-                strat_depts = sorted([d for d in target_df['Отдел'].unique() if d not in excluded_depts])
-                
-            if len(strat_depts) > 0:
-                # Загружаем сохраненные приросты
-                strat_growth_file = os.path.join(DATA_DIR, 'strategic_growth_rates.json')
-                saved_strat_growth = {}
-                if os.path.exists(strat_growth_file):
-                    try:
-                        with open(strat_growth_file, 'r', encoding='utf-8') as f:
-                            data = json.load(f)
-                            for item in data:
-                                saved_strat_growth[(item['branch'], item['dept'])] = item['rate']
-                    except:
-                        pass
-                
-                # Строим DataFrame для редактора
-                df_strat_growth_ui = pd.DataFrame(index=strat_depts, columns=all_branches)
-                
-                # Заполняем сохраненные значения
-                for (br, dp), val in saved_strat_growth.items():
-                    if br in all_branches and dp in strat_depts:
-                        df_strat_growth_ui.at[dp, br] = val
-                
-                # Функция автосохранения при изменении
-                def save_strat_growth_auto():
-                    """Автосохранение приростов стратегических при изменении"""
-                    if 'strat_growth_editor_matrix' in st.session_state:
-                        edited_data = st.session_state['strat_growth_editor_matrix']
-                        # Получаем текущий DataFrame из сессии
-                        current_df = df_strat_growth_ui.copy()
-                        
-                        # Применяем изменения из edited_rows
-                        if 'edited_rows' in edited_data:
-                            for row_idx, changes in edited_data['edited_rows'].items():
-                                row_label = current_df.index[int(row_idx)]
-                                for col, val in changes.items():
-                                    current_df.at[row_label, col] = val
-                        
-                        # Собираем данные для сохранения
-                        new_strat_growth_list = []
-                        for dp in current_df.index:
-                            for br in current_df.columns:
-                                val = current_df.at[dp, br]
-                                if pd.notna(val) and str(val).strip() != '':
-                                    try:
-                                        f_val = float(val)
-                                        new_strat_growth_list.append({
-                                            'branch': br,
-                                            'dept': dp,
-                                            'rate': f_val
-                                        })
-                                    except:
-                                        pass
-                        
-                        # Сохраняем
-                        try:
-                            with open(strat_growth_file, 'w', encoding='utf-8') as f:
-                                json.dump(new_strat_growth_list, f, ensure_ascii=False, indent=2)
-                        except:
-                            pass
-                
-                # Редактор прироста с автосохранением
-                edited_strat_growth_df = st.data_editor(
-                    df_strat_growth_ui,
-                    key='strat_growth_editor_matrix',
-                    use_container_width=True,
-                    height=400,
-                    on_change=save_strat_growth_auto
-                )
-                
-                st.caption("💡 Изменения сохраняются автоматически. Прирост перераспределяется только между стратегическими отделами.")
-            else:
-                st.info("Нет стратегических отделов")
-        else:
-            st.info("Загрузка данных...")
 
 
 # Подготовка таблицы - используем уже рассчитанные колонки из calculate_plan
@@ -4467,6 +4459,194 @@ edited_df = st.data_editor(
     column_config=col_config_dynamic,
     key="main_data_editor"
 )
+
+# --- НАСТРОЙКА (Прирост) --- ML оптимизатор управляет лимитами автоматически
+with st.expander("⚙️ Настройка", expanded=False):
+    tab_growth, tab_strat_growth = st.tabs(["📈 Прирост на год", "🎯 Прирост стратегических"])
+    
+    # === ВКЛАДКА 2: ПРИРОСТ НА ГОД ===
+    with tab_growth:
+        st.caption("Годовой прирост для Сопутствующих отделов. План = Факт 2025 × (1 + Прирост%) × Сезонность. Правило +6% минимум применяется только к Мини/Микро/Интернет.")
+        
+        # Используем df_base (полный датасет), чтобы настройки не зависели от фильтров
+        target_df = df_base if 'df_base' in locals() and not df_base.empty else df
+        
+        if not target_df.empty:
+            # Показываем ВСЕ филиалы (не только спец-форматы)
+            all_branches = sorted(target_df['Филиал'].unique())
+            
+            # Только Сопутствующие отделы
+            if 'Роль' in target_df.columns:
+                accomp_depts = sorted(target_df[target_df['Роль'] == 'Сопутствующий']['Отдел'].unique())
+            else:
+                accomp_depts = sorted(target_df['Отдел'].unique())
+                
+            if len(accomp_depts) > 0:
+                # Загружаем сохраненные приросты
+                growth_file = os.path.join(DATA_DIR, 'growth_rates.json')
+                saved_growth = {}
+                if os.path.exists(growth_file):
+                    try:
+                        with open(growth_file, 'r', encoding='utf-8') as f:
+                            data = json.load(f)
+                            for item in data:
+                                saved_growth[(item['branch'], item['dept'])] = item['rate']
+                    except:
+                        pass
+                
+                # Строим DataFrame для редактора
+                df_growth_ui = pd.DataFrame(index=accomp_depts, columns=all_branches)
+                
+                # Заполняем сохраненные значения
+                for (br, dp), val in saved_growth.items():
+                    if br in all_branches and dp in accomp_depts:
+                        df_growth_ui.at[dp, br] = val
+                
+                # Функция автосохранения при изменении
+                def save_growth_auto():
+                    """Автосохранение приростов при изменении"""
+                    if 'growth_editor_matrix' in st.session_state:
+                        edited_data = st.session_state['growth_editor_matrix']
+                        # Получаем текущий DataFrame из сессии
+                        current_df = df_growth_ui.copy()
+                        
+                        # Применяем изменения из edited_rows
+                        if 'edited_rows' in edited_data:
+                            for row_idx, changes in edited_data['edited_rows'].items():
+                                row_label = current_df.index[int(row_idx)]
+                                for col, val in changes.items():
+                                    current_df.at[row_label, col] = val
+                        
+                        # Собираем данные для сохранения
+                        new_growth_list = []
+                        for dp in current_df.index:
+                            for br in current_df.columns:
+                                val = current_df.at[dp, br]
+                                if pd.notna(val) and str(val).strip() != '':
+                                    try:
+                                        f_val = float(val)
+                                        new_growth_list.append({
+                                            'branch': br,
+                                            'dept': dp,
+                                            'rate': f_val
+                                        })
+                                    except:
+                                        pass
+                        
+                        # Сохраняем
+                        try:
+                            with open(growth_file, 'w', encoding='utf-8') as f:
+                                json.dump(new_growth_list, f, ensure_ascii=False, indent=2)
+                        except:
+                            pass
+                
+                # Редактор прироста с автосохранением
+                edited_growth_df = st.data_editor(
+                    df_growth_ui,
+                    key='growth_editor_matrix',
+                    use_container_width=True,
+                    height=400,
+                    on_change=save_growth_auto
+                )
+                
+                st.caption("💡 Изменения сохраняются автоматически")
+            else:
+                st.info("Нет сопутствующих отделов")
+        else:
+            pass  # Ждём загрузки данных
+    
+    # === ВКЛАДКА 3: ПРИРОСТ СТРАТЕГИЧЕСКИХ ===
+    with tab_strat_growth:
+        st.caption("Годовой прирост для Стратегических отделов. Увеличение прироста одного отдела уменьшает другие пропорционально. Не влияет на ручные корректировки и методику Дверей/Кухонь.")
+        
+        # Используем df_base (полный датасет), чтобы настройки не зависели от фильтров
+        target_df = df_base if 'df_base' in locals() and not df_base.empty else df
+        
+        if not target_df.empty:
+            # Показываем ВСЕ филиалы
+            all_branches = sorted(target_df['Филиал'].unique())
+            
+            # Только Стратегические отделы (исключаем Двери и Кухни)
+            excluded_depts = ['9. Двери, фурнитура дверная', 'Мебель для кухни']
+            if 'Роль' in target_df.columns:
+                strat_depts = sorted([d for d in target_df[target_df['Роль'] != 'Сопутствующий']['Отдел'].unique() 
+                                     if d not in excluded_depts])
+            else:
+                strat_depts = sorted([d for d in target_df['Отдел'].unique() if d not in excluded_depts])
+                
+            if len(strat_depts) > 0:
+                # Загружаем сохраненные приросты
+                strat_growth_file = os.path.join(DATA_DIR, 'strategic_growth_rates.json')
+                saved_strat_growth = {}
+                if os.path.exists(strat_growth_file):
+                    try:
+                        with open(strat_growth_file, 'r', encoding='utf-8') as f:
+                            data = json.load(f)
+                            for item in data:
+                                saved_strat_growth[(item['branch'], item['dept'])] = item['rate']
+                    except:
+                        pass
+                
+                # Строим DataFrame для редактора
+                df_strat_growth_ui = pd.DataFrame(index=strat_depts, columns=all_branches)
+                
+                # Заполняем сохраненные значения
+                for (br, dp), val in saved_strat_growth.items():
+                    if br in all_branches and dp in strat_depts:
+                        df_strat_growth_ui.at[dp, br] = val
+                
+                # Функция автосохранения при изменении
+                def save_strat_growth_auto():
+                    """Автосохранение приростов стратегических при изменении"""
+                    if 'strat_growth_editor_matrix' in st.session_state:
+                        edited_data = st.session_state['strat_growth_editor_matrix']
+                        # Получаем текущий DataFrame из сессии
+                        current_df = df_strat_growth_ui.copy()
+                        
+                        # Применяем изменения из edited_rows
+                        if 'edited_rows' in edited_data:
+                            for row_idx, changes in edited_data['edited_rows'].items():
+                                row_label = current_df.index[int(row_idx)]
+                                for col, val in changes.items():
+                                    current_df.at[row_label, col] = val
+                        
+                        # Собираем данные для сохранения
+                        new_strat_growth_list = []
+                        for dp in current_df.index:
+                            for br in current_df.columns:
+                                val = current_df.at[dp, br]
+                                if pd.notna(val) and str(val).strip() != '':
+                                    try:
+                                        f_val = float(val)
+                                        new_strat_growth_list.append({
+                                            'branch': br,
+                                            'dept': dp,
+                                            'rate': f_val
+                                        })
+                                    except:
+                                        pass
+                        
+                        # Сохраняем
+                        try:
+                            with open(strat_growth_file, 'w', encoding='utf-8') as f:
+                                json.dump(new_strat_growth_list, f, ensure_ascii=False, indent=2)
+                        except:
+                            pass
+                
+                # Редактор прироста с автосохранением
+                edited_strat_growth_df = st.data_editor(
+                    df_strat_growth_ui,
+                    key='strat_growth_editor_matrix',
+                    use_container_width=True,
+                    height=400,
+                    on_change=save_strat_growth_auto
+                )
+                
+                st.caption("💡 Изменения сохраняются автоматически. Прирост перераспределяется только между стратегическими отделами.")
+            else:
+                st.info("Нет стратегических отделов")
+        else:
+            pass  # Ждём загрузки данных
     
 # Для логики сохранения нам нужно добавить в edited_df недостающие колонки (месяц числом), 
 # чтобы логика внизу (iterrows) работала корректно.

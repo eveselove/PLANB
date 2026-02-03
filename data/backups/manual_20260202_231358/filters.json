@@ -1,7 +1,11 @@
 {
-  "branches": [],
+  "branches": [
+    "Вологда ТЦ"
+  ],
   "depts": [],
   "months": [],
+  "roles": [],
+  "formats": [],
   "optional_columns": [
     "Выручка_2024",
     "Прирост_%",
