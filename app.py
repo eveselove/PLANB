@@ -63,8 +63,9 @@ st.markdown("""
 # КОНФИГУРАЦИЯ
 # ============================================================================
 
-DATA_DIR = '/home/eveselove/PLANB/data'
-DATA_FILE = '/home/eveselove/PLAN/dashboard_data.csv'
+# Относительные пути для совместимости с Streamlit Cloud
+DATA_DIR = os.path.join(os.path.dirname(__file__), 'data')
+DATA_FILE = os.path.join(os.path.dirname(__file__), 'dashboard_data.csv')
 
 # ============================================================================
 # GOOGLE SHEETS ID (ИЗ НОУТБУКА)
@@ -86,8 +87,8 @@ ROLES_GID = '93699808'     # Роли отделов
 
 
 
-if not os.path.exists(DATA_DIR):
-    os.makedirs(DATA_DIR)
+# Создаём директорию данных, если её нет (с exist_ok для Streamlit Cloud)
+os.makedirs(DATA_DIR, exist_ok=True)
 
 
 CONFIG = {
