@@ -2758,7 +2758,7 @@ def calculate_plan(df_sales, corrections=None, role_coefficients=None, limits=No
 
 
 
-@st.cache_data(ttl=300, show_spinner="📊 Загрузка данных...")
+@st.cache_data(ttl=300, show_spinner=False)
 def load_raw_data():
     """
     Загружает данные продаж из Google Sheets (полная логика из ноутбука)
@@ -3289,53 +3289,6 @@ if 'splash_shown' not in st.session_state:
     # Полноэкранный белый фон с центрированием
     splash = st.empty()
     
-    # CSS для кнопки сайдбара — загружаем СРАЗУ чтобы не было синего артефакта
-    horse_b64_splash = "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"
-    
-    st.markdown(f"""
-    <style>
-        /* Кнопка сайдбара — круглая FAB стиль Material Design */
-        button[data-testid="stBaseButton-headerNoPadding"],
-        button[kind="headerNoPadding"] {{
-            background-color: white !important;
-            background-image: url('data:image/png;base64,{horse_b64_splash}') !important;
-            background-repeat: no-repeat !important;
-            background-position: center center !important;
-            background-size: 40px 40px !important;
-            width: 56px !important;
-            height: 56px !important;
-            border: 2px solid #e8e8e8 !important;
-            border-radius: 50% !important;
-            box-shadow: 0 3px 5px -1px rgba(0,0,0,0.2), 0 6px 10px 0 rgba(0,0,0,0.14), 0 1px 18px 0 rgba(0,0,0,0.12) !important;
-            overflow: hidden !important;
-            position: relative !important;
-            transition: box-shadow 0.28s cubic-bezier(0.4, 0, 0.2, 1) !important;
-        }}
-        button[data-testid="stBaseButton-headerNoPadding"] *,
-        button[kind="headerNoPadding"] * {{
-            display: none !important;
-            visibility: hidden !important;
-        }}
-        button[data-testid="stBaseButton-headerNoPadding"]::before,
-        button[kind="headerNoPadding"]::before {{
-            content: "" !important;
-            position: absolute !important;
-            top: 0 !important;
-            left: 0 !important;
-            right: 0 !important;
-            bottom: 0 !important;
-            background: white url('data:image/png;base64,{horse_b64_splash}') no-repeat center center !important;
-            background-size: 40px 40px !important;
-            border-radius: 50% !important;
-            z-index: 9999 !important;
-        }}
-        button[data-testid="stBaseButton-headerNoPadding"]:hover,
-        button[kind="headerNoPadding"]:hover {{
-            box-shadow: 0 5px 5px -3px rgba(0,0,0,0.2), 0 8px 10px 1px rgba(0,0,0,0.14), 0 3px 14px 2px rgba(0,0,0,0.12) !important;
-        }}
-    </style>
-    """, unsafe_allow_html=True)
-    
     with splash.container():
         st.markdown("""
         <style>
@@ -3413,14 +3366,14 @@ if 'splash_shown' not in st.session_state:
     st.session_state['splash_shown'] = True
 
 if 'data_loaded' not in st.session_state:
-    with st.spinner("📊 Загрузка данных..."):
-        st.session_state['raw_sales'] = load_raw_data()
-        st.session_state['rules'] = load_rules()
-        st.session_state['roles'] = load_roles()
-        st.session_state['branch_plans'] = load_branch_plans()
-        st.session_state['areas'] = load_areas()
-        st.session_state['data_loaded'] = True
-        st.session_state['load_time'] = pd.Timestamp.now().strftime('%H:%M:%S')
+    # Загрузка данных без видимого spinner
+    st.session_state['raw_sales'] = load_raw_data()
+    st.session_state['rules'] = load_rules()
+    st.session_state['roles'] = load_roles()
+    st.session_state['branch_plans'] = load_branch_plans()
+    st.session_state['areas'] = load_areas()
+    st.session_state['data_loaded'] = True
+    st.session_state['load_time'] = pd.Timestamp.now().strftime('%H:%M:%S')
 
 
 
@@ -3448,55 +3401,24 @@ def prepare_plan_csv(dataframe):
     return export_df.to_csv(index=False).encode('utf-8')
 
 if not df_base.empty:
-    # CSS для замены кнопки сайдбара на изображение лошадки
-    horse_b64 = "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"
-    
-    st.sidebar.markdown(f"""
-    <style>
-        /* Заменяем кнопку сайдбара на изображение лошадки — полностью непрозрачная */
-        button[data-testid="stBaseButton-headerNoPadding"],
-        button[kind="headerNoPadding"] {{
-            background-color: white !important;
-            background-image: url('data:image/png;base64,{horse_b64}') !important;
-            background-repeat: no-repeat !important;
-            background-position: center center !important;
-            background-size: 50px 50px !important;
-            width: 60px !important;
-            height: 60px !important;
-            border: 1px solid #e0e0e0 !important;
-            border-radius: 12px !important;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.1) !important;
-            overflow: hidden !important;
-            position: relative !important;
-        }}
-        /* Скрываем SVG стрелки полностью */
-        button[data-testid="stBaseButton-headerNoPadding"] svg,
-        button[kind="headerNoPadding"] svg {{
-            display: none !important;
-            visibility: hidden !important;
-            opacity: 0 !important;
-        }}
-        /* Белый слой поверх всего внутри кнопки */
-        button[data-testid="stBaseButton-headerNoPadding"]::before,
-        button[kind="headerNoPadding"]::before {{
-            content: "" !important;
-            position: absolute !important;
-            top: 0 !important;
-            left: 0 !important;
-            right: 0 !important;
-            bottom: 0 !important;
-            background: white url('data:image/png;base64,{horse_b64}') no-repeat center center !important;
-            background-size: 50px 50px !important;
-            border-radius: 12px !important;
-            z-index: 999 !important;
-        }}
-        button[data-testid="stBaseButton-headerNoPadding"]:hover,
-        button[kind="headerNoPadding"]:hover {{
-            box-shadow: 0 6px 16px rgba(0,0,0,0.15) !important;
-            border-color: #ccc !important;
-        }}
-    </style>
-    """, unsafe_allow_html=True)
+    st.sidebar.download_button(
+        label="📥 Скачать план CSV",
+        data=prepare_plan_csv(df_base),
+        file_name="plan_2026.csv",
+        mime="text/csv",
+        use_container_width=True
+    )
+
+
+# CSS для центрирования заголовка сайдбара
+st.sidebar.markdown("""
+<style>
+    section[data-testid="stSidebar"] h2,
+    section[data-testid="stSidebar"] .stCaption {
+        text-align: center !important;
+    }
+</style>
+""", unsafe_allow_html=True)
 
 # Заголовок и дата — ФИЛЬТРЫ ВВЕРХУ
 st.sidebar.header("📊 Фильтры")
@@ -3847,15 +3769,15 @@ with col1:
         showlegend=False
     ))
     
-    # Аннотации с процентами у основания столбцов
+    # Аннотации с процентами в середине столбцов
     if show_plan:
-        y_min = m_full['План_Скорр'].min() * 0.02
         annotations = []
         for _, row in m_full.iterrows():
             val = row['Δ_План_25']
+            y_pos = row['План_Скорр'] * 0.5  # Середина столбца
             color = '#27ae60' if val >= 0 else '#e74c3c'
             annotations.append(dict(
-                x=row['M'], y=y_min,
+                x=row['M'], y=y_pos,
                 text=f"<b>{val:+.0f}%</b>",
                 showarrow=False,
                 font=dict(size=10, color=color),
