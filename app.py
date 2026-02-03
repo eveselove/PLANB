@@ -3395,8 +3395,17 @@ if st.sidebar.button("🔄 Обновить данные", type="primary", use_c
 # ========== КОМПРЕССОР ОТКЛЮЧЁН — ML ОПТИМИЗАТОР УПРАВЛЯЕТ АВТОМАТИЧЕСКИ ==========
 role_coefficients = None
 
-# Загрузка данных с учётом корректировок и расчётом плана
-df_base = get_plan_data(role_coefficients=role_coefficients)
+# Загрузка данных из предрассчитанного CSV (гарантирует идентичность на всех платформах)
+PRECALCULATED_FILE = os.path.join(DATA_DIR, 'plan_calculated.csv')
+if os.path.exists(PRECALCULATED_FILE):
+    df_base = pd.read_csv(PRECALCULATED_FILE)
+    # Восстанавливаем типы данных
+    for col in ['План_Скорр', 'Rev_2025', 'Rev_2024', 'Выручка_2025', 'Выручка_2024']:
+        if col in df_base.columns:
+            df_base[col] = pd.to_numeric(df_base[col], errors='coerce').fillna(0)
+else:
+    # Fallback на расчёт, если файл не найден
+    df_base = get_plan_data(role_coefficients=role_coefficients)
 
 # Сайдбар - Кнопка скачивания плана
 def prepare_plan_csv(dataframe):
