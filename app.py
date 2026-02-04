@@ -311,11 +311,14 @@ def calculate_delivery_plan(df_sales, branch_plans):
     Returns:
         DataFrame с планами Доставки по филиалам/месяцам
     """
-    # Фильтруем только 2025 год и Доставку
+    # Фильтруем только 2025 год
     df_2025 = df_sales[(df_sales['Год'] == 2025)].copy()
     
     if df_2025.empty:
         return pd.DataFrame()
+    
+    # Приводим Месяц к int
+    df_2025['Месяц'] = df_2025['Месяц'].astype(int)
     
     # Создаём группу для расчёта доли
     df_2025['Группа_Для_Доли'] = df_2025['Филиал'].map(
@@ -344,14 +347,19 @@ def calculate_delivery_plan(df_sales, branch_plans):
         return pd.DataFrame()
     
     bp = branch_plans.copy()
+    bp['Месяц'] = bp['Месяц'].astype(int)  # Приводим к int
     bp['Группа_Для_Доли'] = bp['Филиал'].map(
         lambda x: DELIVERY_BRANCH_GROUPS.get(x, x)
     )
+    
+    # Приводим Месяц в shares к int
+    shares['Месяц'] = shares['Месяц'].astype(int)
     
     # Объединяем с долями
     bp = bp.merge(shares[['Группа_Для_Доли', 'Месяц', 'Доля_Доставки']], 
                   on=['Группа_Для_Доли', 'Месяц'], how='left')
     bp['Доля_Доставки'] = bp['Доля_Доставки'].fillna(0)
+    
     
     # Рассчитываем "сырой" план Доставки (как долю от плана филиала)
     bp['План_Доставки_Сырой'] = bp['План'] * bp['Доля_Доставки']
@@ -837,7 +845,7 @@ def apply_load_coefficients(df, role_coefficients):
     return result
 
 
-def calculate_plan(df_sales, corrections=None, role_coefficients=None, limits=None):
+def calculate_plan(df_sales, corrections=None, role_coefficients=None, limits=None, branch_plans=None):
     """
     Полный расчёт плана с учетом лимитов роста.
     """
@@ -1041,8 +1049,10 @@ def calculate_plan(df_sales, corrections=None, role_coefficients=None, limits=No
         df_master['Роль'] = 'Сопутствующий'
 
     # ========== ШАГ 10: ЗАГРУЗКА ЦЕЛЕВЫХ ПЛАНОВ ФИЛИАЛОВ ==========
-    # План спущен сверху — берём из session_state или загружаем
-    if 'branch_plans' in st.session_state:
+    # План спущен сверху — берём из параметра, session_state или загружаем
+    if branch_plans is not None:
+        df_branch_plans = branch_plans
+    elif 'branch_plans' in st.session_state:
         df_branch_plans = st.session_state['branch_plans']
     else:
         df_branch_plans = load_branch_plans()
@@ -1120,8 +1130,10 @@ def calculate_plan(df_sales, corrections=None, role_coefficients=None, limits=No
     
     precalc_plans = {}
     
-    # 1. Загружаем цели филиалов
-    if 'branch_plans' in st.session_state:
+    # 1. Загружаем цели филиалов (используем переданный параметр если есть)
+    if branch_plans is not None:
+        df_plans = branch_plans
+    elif 'branch_plans' in st.session_state:
         df_plans = st.session_state['branch_plans']
     else:
         df_plans = load_branch_plans()
@@ -3134,52 +3146,122 @@ def get_plan_data(role_coefficients=None):
     corrections = load_corrections_local()
     limits = load_limits_local()
     
+    # ========== ПРИОРИТЕТНЫЙ РАСЧЁТ ДОСТАВКИ ==========
+    # Доставка рассчитывается ПЕРВОЙ и забирает часть целевых планов филиалов
+    
+    if 'branch_plans' in st.session_state:
+        branch_plans_original = st.session_state['branch_plans'].copy()
+    else:
+        branch_plans_original = load_branch_plans()
+    
+    branch_plans_adjusted = None
+    delivery_plan_result = None
+    
+    if branch_plans_original is not None and not branch_plans_original.empty:
+        # Рассчитываем план Доставки
+        delivery_plan_result = calculate_delivery_plan(df_sales, branch_plans_original)
+        
+        # DEBUG: Проверка результата Доставки
+        if delivery_plan_result is not None and not delivery_plan_result.empty:
+            delivery_total = delivery_plan_result['План_Скорр'].sum()
+            
+            # Группируем план Доставки по филиалу и месяцу
+            delivery_by_branch_month = delivery_plan_result.groupby(['Филиал', 'Месяц'])['План_Скорр'].sum().reset_index()
+            delivery_by_branch_month.columns = ['Филиал', 'Месяц', 'План_Доставки']
+            
+            # DEBUG: Проверка суммы до уменьшения
+            original_total = branch_plans_original['План'].sum()
+            
+            # Уменьшаем целевые планы филиалов на сумму Доставки
+            # Приводим типы для корректного merge
+            branch_plans_original['Месяц'] = branch_plans_original['Месяц'].astype(int)
+            branch_plans_original['Филиал'] = branch_plans_original['Филиал'].astype(str).str.strip()
+            delivery_by_branch_month['Месяц'] = delivery_by_branch_month['Месяц'].astype(int)
+            delivery_by_branch_month['Филиал'] = delivery_by_branch_month['Филиал'].astype(str).str.strip()
+            
+            branch_plans_adjusted = branch_plans_original.merge(
+                delivery_by_branch_month, on=['Филиал', 'Месяц'], how='left'
+            )
+            branch_plans_adjusted['План_Доставки'] = branch_plans_adjusted['План_Доставки'].fillna(0)
+            branch_plans_adjusted['План'] = branch_plans_adjusted['План'] - branch_plans_adjusted['План_Доставки']
+            branch_plans_adjusted = branch_plans_adjusted[['Филиал', 'Месяц', 'План']]
+            
+            # DEBUG: Проверка суммы после уменьшения
+            adjusted_total = branch_plans_adjusted['План'].sum()
+        else:
+            branch_plans_adjusted = None
+    else:
+        branch_plans_adjusted = None
+    
     # Исключаем Доставку из основного расчёта (считается отдельно)
     df_sales_no_delivery = df_sales[df_sales['Отдел'] != 'Доставка.'].copy()
     
     # Полный цикл расчета для всех отделов кроме Доставки
-    result = calculate_plan(df_sales_no_delivery, corrections=corrections, role_coefficients=role_coefficients, limits=limits)
+    # Передаём скорректированные планы (уменьшенные на сумму Доставки)
     
-    # Добавляем план Доставки по специальной логике
-    if 'branch_plans' in st.session_state:
-        branch_plans = st.session_state['branch_plans']
-    else:
-        branch_plans = load_branch_plans()
+    result = calculate_plan(
+        df_sales_no_delivery, 
+        corrections=corrections, 
+        role_coefficients=role_coefficients, 
+        limits=limits,
+        branch_plans=branch_plans_adjusted  # Используем уменьшенные планы для расчёта
+    )
     
-    if branch_plans is not None and not branch_plans.empty:
-        delivery_plan = calculate_delivery_plan(df_sales, branch_plans)
+    # ВАЖНО: Восстанавливаем оригинальные целевые планы в колонке 'План'
+    # для корректного расчёта сходимости (сравниваем с оригиналом, не со скорректированным)
+    if branch_plans_original is not None and 'План' in result.columns:
+        # Удаляем текущую колонку План (которая со скорректированными значениями)
+        result = result.drop(columns=['План'], errors='ignore')
+        # Мержим с оригинальными планами
+        branch_plans_original['Месяц'] = branch_plans_original['Месяц'].astype(int)
+        branch_plans_original['Филиал'] = branch_plans_original['Филиал'].astype(str).str.strip()
+        result['Месяц'] = result['Месяц'].astype(int)
+        result['Филиал'] = result['Филиал'].astype(str).str.strip()
+        result = result.merge(
+            branch_plans_original[['Филиал', 'Месяц', 'План']], 
+            on=['Филиал', 'Месяц'], 
+            how='left'
+        )
+        result['План'] = result['План'].fillna(0)
+    
+    # Добавляем план Доставки к результату
+    if delivery_plan_result is not None and not delivery_plan_result.empty:
+        delivery_plan = delivery_plan_result.copy()
         
-        if not delivery_plan.empty:
-            # Добавляем недостающие колонки для Доставки
-            delivery_full = df_sales[df_sales['Отдел'] == 'Доставка.'].copy()
-            if not delivery_full.empty:
-                # Берём данные 2025 года для расчёта прироста
-                rev_2025 = delivery_full[delivery_full['Год'] == 2025].groupby(['Филиал', 'Месяц'])['Выручка'].sum().reset_index()
-                rev_2025.columns = ['Филиал', 'Месяц', 'Rev_2025']
-                
-                rev_2024 = delivery_full[delivery_full['Год'] == 2024].groupby(['Филиал', 'Месяц'])['Выручка'].sum().reset_index()
-                rev_2024.columns = ['Филиал', 'Месяц', 'Rev_2024']
-                
-                delivery_plan = delivery_plan.merge(rev_2025, on=['Филиал', 'Месяц'], how='left')
-                delivery_plan = delivery_plan.merge(rev_2024, on=['Филиал', 'Месяц'], how='left')
-                delivery_plan['Rev_2025'] = delivery_plan['Rev_2025'].fillna(0)
-                delivery_plan['Rev_2024'] = delivery_plan['Rev_2024'].fillna(0)
-                delivery_plan['Выручка_2025'] = delivery_plan['Rev_2025']
-                delivery_plan['Выручка_2024'] = delivery_plan['Rev_2024']
-                
-                # Прирост
-                delivery_plan['Прирост_%'] = calc_growth_pct(delivery_plan['План_Скорр'], delivery_plan['Rev_2025'])
-                delivery_plan['Прирост_24_26_%'] = calc_growth_pct(delivery_plan['План_Скорр'], delivery_plan['Rev_2024'])
-                
-                # Роль
-                delivery_plan['Роль'] = 'Сопутствующий'
-                delivery_plan['Формат'] = delivery_plan['Филиал'].map(BRANCH_FORMATS).fillna('N/A')
-                
-                # Удаляем любые существующие строки Доставки из основного результата
-                result = result[result['Отдел'] != 'Доставка.'].copy()
-                
-                # Добавляем к основному результату
-                result = pd.concat([result, delivery_plan], ignore_index=True)
+        # Добавляем недостающие колонки для Доставки
+        delivery_full = df_sales[df_sales['Отдел'] == 'Доставка.'].copy()
+        if not delivery_full.empty:
+            # Берём данные 2025 года для расчёта прироста
+            rev_2025 = delivery_full[delivery_full['Год'] == 2025].groupby(['Филиал', 'Месяц'])['Выручка'].sum().reset_index()
+            rev_2025.columns = ['Филиал', 'Месяц', 'Rev_2025']
+            
+            rev_2024 = delivery_full[delivery_full['Год'] == 2024].groupby(['Филиал', 'Месяц'])['Выручка'].sum().reset_index()
+            rev_2024.columns = ['Филиал', 'Месяц', 'Rev_2024']
+            
+            delivery_plan = delivery_plan.merge(rev_2025, on=['Филиал', 'Месяц'], how='left')
+            delivery_plan = delivery_plan.merge(rev_2024, on=['Филиал', 'Месяц'], how='left')
+            delivery_plan['Rev_2025'] = delivery_plan['Rev_2025'].fillna(0)
+            delivery_plan['Rev_2024'] = delivery_plan['Rev_2024'].fillna(0)
+            delivery_plan['Выручка_2025'] = delivery_plan['Rev_2025']
+            delivery_plan['Выручка_2024'] = delivery_plan['Rev_2024']
+            
+            # Прирост
+            delivery_plan['Прирост_%'] = calc_growth_pct(delivery_plan['План_Скорр'], delivery_plan['Rev_2025'])
+            delivery_plan['Прирост_24_26_%'] = calc_growth_pct(delivery_plan['План_Скорр'], delivery_plan['Rev_2024'])
+            
+            # Роль
+            delivery_plan['Роль'] = 'Сопутствующий'
+            delivery_plan['Формат'] = delivery_plan['Филиал'].map(BRANCH_FORMATS).fillna('N/A')
+            
+            # Удаляем любые существующие строки Доставки из основного результата
+            result = result[result['Отдел'] != 'Доставка.'].copy()
+            
+            # ВАЖНО: План для Доставки = 0, т.к. она уже учтена в целевых планах филиалов
+            # Это нужно, чтобы при подсчёте сходимости не считать целевой план дважды
+            delivery_plan['План'] = 0
+            
+            # Добавляем к основному результату
+            result = pd.concat([result, delivery_plan], ignore_index=True)
     
     return result
 
